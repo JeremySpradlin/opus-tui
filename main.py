@@ -1,4 +1,4 @@
-"""Textual TUI for managing projects: local + GitHub side-by-side.
+"""Textual TUI for managing projects: local-primary, GitHub on toggle.
 
 A "local project" is any direct subdir of ~/Projects/ that contains
 a .git directory. A local project is considered "synced" with GitHub
@@ -17,21 +17,17 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal
-from textual.widgets import DataTable, Footer, Header
+from textual.containers import Vertical
+from textual.reactive import reactive
+from textual.widgets import DataTable, Footer, Rule, Static
 
 PROJECTS_DIR = Path.home() / "Projects"
 
 REPO_FIELDS = [
     "name",
     "nameWithOwner",
-    "description",
     "primaryLanguage",
-    "stargazerCount",
-    "updatedAt",
     "visibility",
-    "isFork",
-    "isArchived",
 ]
 
 GITHUB_REMOTE_RE = re.compile(
@@ -43,8 +39,19 @@ CTP = {
     "text":     "#cdd6f4", "subtext0": "#a6adc8", "overlay2": "#9399b2",
     "overlay1": "#7f849c", "overlay0": "#6c7086",
     "green":    "#a6e3a1", "teal":     "#94e2d5", "red":      "#f38ba8",
+    "mauve":    "#cba6f7", "pink":     "#f5c2e7", "lavender": "#b4befe",
     "crust":    "#11111b",
 }
+
+ASCII_TITLE = [
+    " ██████╗ ██████╗ ██╗   ██╗███████╗ ████████╗██╗   ██╗██╗",
+    "██╔═══██╗██╔══██╗██║   ██║██╔════╝ ╚══██╔══╝██║   ██║██║",
+    "██║   ██║██████╔╝██║   ██║███████╗    ██║   ██║   ██║██║",
+    "██║   ██║██╔═══╝ ██║   ██║╚════██║    ██║   ██║   ██║██║",
+    "╚██████╔╝██║     ╚██████╔╝███████║    ██║   ╚██████╔╝██║",
+    " ╚═════╝ ╚═╝      ╚═════╝ ╚══════╝    ╚═╝    ╚═════╝ ╚═╝",
+]
+ASCII_GRADIENT = ["mauve", "mauve", "lavender", "lavender", "pink", "pink"]
 
 LANGUAGE_COLORS = {
     "Python":     "#3572A5", "JavaScript": "#f1e05a", "TypeScript": "#3178c6",
@@ -154,9 +161,66 @@ def github_sync_cell(synced: bool) -> Text:
     return Text("☁", style=f"bold {CTP['teal']}")
 
 
+class Banner(Vertical):
+    """Top banner: ASCII title with gradient, tagline + stats, heavy rule."""
+
+    DEFAULT_CSS = """
+    Banner {
+        height: 10;
+        padding: 1 2 0 2;
+        background: $background;
+    }
+    Banner > #banner-ascii {
+        height: 6;
+        background: transparent;
+    }
+    Banner > #banner-stats {
+        height: 1;
+        margin-top: 1;
+        background: transparent;
+    }
+    Banner > Rule {
+        height: 1;
+        margin: 0;
+        color: $surface;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="banner-ascii")
+        yield Static(id="banner-stats")
+        yield Rule(line_style="heavy")
+
+    def on_mount(self) -> None:
+        ascii_text = Text()
+        for idx, line in enumerate(ASCII_TITLE):
+            color = CTP[ASCII_GRADIENT[idx]]
+            ascii_text.append(line, style=f"bold {color}")
+            if idx < len(ASCII_TITLE) - 1:
+                ascii_text.append("\n")
+        self.query_one("#banner-ascii", Static).update(ascii_text)
+        self.show_stats("local", 0, 0, 0)
+
+    def show_stats(self, view: str, local: int, github: int, synced: int) -> None:
+        view_label = "  Local" if view == "local" else "  GitHub"
+        view_color = CTP["green"] if view == "local" else CTP["teal"]
+        stats = Text.assemble(
+            ("your project switchboard", f"italic {CTP['overlay2']}"),
+            ("    ", ""),
+            (view_label, f"bold {view_color}"),
+            ("  ·  ", CTP["overlay1"]),
+            (str(local), f"bold {CTP['text']}"),
+            (" projects  ·  ", CTP["overlay1"]),
+            (str(github), f"bold {CTP['text']}"),
+            (" on github  ·  ", CTP["overlay1"]),
+            (str(synced), f"bold {CTP['green']}"),
+            (" synced", CTP["overlay1"]),
+        )
+        self.query_one("#banner-stats", Static).update(stats)
+
+
 class ProjectsApp(App):
     TITLE = "opus-tui"
-    SUB_TITLE = "loading…"
 
     ENABLE_COMMAND_PALETTE = False
 
@@ -164,26 +228,12 @@ class ProjectsApp(App):
     Screen {
         background: $background;
     }
-    Header {
-        background: $background;
-        color: $primary;
-        text-style: bold;
-    }
-    Horizontal {
-        height: 1fr;
-    }
     DataTable {
-        width: 1fr;
         height: 1fr;
-        border: heavy $surface;
-        border-title-color: $secondary;
-        border-title-style: bold;
-        border-title-align: left;
-        margin: 0 1;
-    }
-    DataTable:focus {
-        border: heavy $primary;
-        border-title-color: $primary;
+        border: blank;
+        background: transparent;
+        margin: 1 3 0 3;
+        scrollbar-size-vertical: 1;
     }
     Footer {
         background: $surface;
@@ -193,96 +243,109 @@ class ProjectsApp(App):
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
-        Binding("tab", "switch_pane", "Switch pane"),
+        Binding("g", "toggle_view", "Switch view"),
         Binding("r", "refresh", "Refresh"),
     ]
 
+    view: reactive[str] = reactive("local", init=False)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.local_projects: list[dict] = []
+        self.github_repos: list[dict] = []
+
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
-        with Horizontal():
-            yield DataTable(id="local", cursor_type="row", zebra_stripes=True)
-            yield DataTable(id="github", cursor_type="row", zebra_stripes=True)
+        yield Banner()
+        yield DataTable(
+            id="projects",
+            cursor_type="row",
+            zebra_stripes=True,
+            show_header=False,
+        )
         yield Footer()
 
     def on_mount(self) -> None:
         self.theme = "catppuccin-mocha"
-
-        local = self.query_one("#local", DataTable)
-        local.border_title = "  Local · ~/Projects "
-        local.add_column(" ", key="sync", width=2)
-        local.add_column("Name", key="name")
-        local.add_column("Remote", key="remote")
-        local.loading = True
-
-        github = self.query_one("#github", DataTable)
-        github.border_title = "  GitHub "
-        github.add_column(" ", key="sync", width=2)
-        github.add_column("Name", key="name")
-        github.add_column("Vis", key="vis", width=11)
-        github.add_column("Lang", key="lang")
-        github.loading = True
-
-        local.focus()
+        self._setup_columns_for_view("local")
+        table = self.query_one("#projects", DataTable)
+        table.loading = True
+        table.focus()
         self.load_data()
+
+    def _setup_columns_for_view(self, view: str) -> None:
+        table = self.query_one("#projects", DataTable)
+        table.clear(columns=True)
+        if view == "local":
+            table.add_column(" ", key="sync", width=2)
+            table.add_column("Name", key="name")
+            table.add_column("Remote", key="remote")
+        else:
+            table.add_column(" ", key="sync", width=2)
+            table.add_column("Name", key="name")
+            table.add_column("Visibility", key="vis", width=11)
+            table.add_column("Language", key="lang")
 
     @work(thread=True)
     def load_data(self) -> None:
         local_projects = scan_local_projects()
         github_repos = fetch_github_repos()
-        self.call_from_thread(self.populate, local_projects, github_repos)
+        self.call_from_thread(self._on_data_loaded, local_projects, github_repos)
 
-    def populate(self, local_projects: list[dict], github_repos: list[dict]) -> None:
-        github_owner_names = {r["nameWithOwner"] for r in github_repos}
-        local_owner_names = {p["github"] for p in local_projects if p["github"]}
+    def _on_data_loaded(
+        self, local_projects: list[dict], github_repos: list[dict]
+    ) -> None:
+        self.local_projects = local_projects
+        self.github_repos = github_repos
+        self._render_view()
+        self.query_one("#projects", DataTable).loading = False
 
-        local_table = self.query_one("#local", DataTable)
-        local_table.clear()
-        for proj in local_projects:
-            synced = proj["github"] in github_owner_names
-            local_table.add_row(
-                local_sync_cell(synced),
-                name_cell(proj["name"]),
-                remote_cell(proj["github"]),
-            )
-        local_table.loading = False
-
-        github_table = self.query_one("#github", DataTable)
-        github_table.clear()
-        for repo in github_repos:
-            synced = repo["nameWithOwner"] in local_owner_names
-            lang = (repo.get("primaryLanguage") or {}).get("name") or "-"
-            github_table.add_row(
-                github_sync_cell(synced),
-                name_cell(repo["name"]),
-                vis_cell(repo["visibility"]),
-                lang_cell(lang),
-            )
-        github_table.loading = False
-
+    def _render_view(self) -> None:
+        github_owner_names = {r["nameWithOwner"] for r in self.github_repos}
+        local_owner_names = {p["github"] for p in self.local_projects if p["github"]}
         synced_count = sum(
-            1 for p in local_projects if p["github"] in github_owner_names
-        )
-        self.sub_title = (
-            f"{len(local_projects)} local · {len(github_repos)} on github · "
-            f"{synced_count} synced"
+            1 for p in self.local_projects if p["github"] in github_owner_names
         )
 
-    def action_switch_pane(self) -> None:
-        tables = list(self.query(DataTable))
-        if not tables:
-            return
-        focused = self.focused
-        if focused in tables:
-            idx = tables.index(focused)
-            tables[(idx + 1) % len(tables)].focus()
+        self.query_one(Banner).show_stats(
+            self.view,
+            len(self.local_projects),
+            len(self.github_repos),
+            synced_count,
+        )
+
+        self._setup_columns_for_view(self.view)
+        table = self.query_one("#projects", DataTable)
+
+        if self.view == "local":
+            for proj in self.local_projects:
+                synced = proj["github"] in github_owner_names
+                table.add_row(
+                    local_sync_cell(synced),
+                    name_cell(proj["name"]),
+                    remote_cell(proj["github"]),
+                )
         else:
-            tables[0].focus()
+            for repo in self.github_repos:
+                synced = repo["nameWithOwner"] in local_owner_names
+                lang = (repo.get("primaryLanguage") or {}).get("name") or "-"
+                table.add_row(
+                    github_sync_cell(synced),
+                    name_cell(repo["name"]),
+                    vis_cell(repo["visibility"]),
+                    lang_cell(lang),
+                )
+
+    def watch_view(self, _old: str, _new: str) -> None:
+        if self.local_projects or self.github_repos:
+            self._render_view()
+
+    def action_toggle_view(self) -> None:
+        self.view = "github" if self.view == "local" else "local"
 
     def action_refresh(self) -> None:
-        self.sub_title = "refreshing…"
-        for table in self.query(DataTable):
-            table.clear()
-            table.loading = True
+        table = self.query_one("#projects", DataTable)
+        table.clear()
+        table.loading = True
         self.load_data()
 
 
