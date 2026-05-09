@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -37,6 +38,26 @@ GITHUB_REMOTE_RE = re.compile(
     r"^(?:https?://github\.com/|git@github\.com:)"
     r"(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
 )
+
+CTP = {
+    "text":     "#cdd6f4", "subtext0": "#a6adc8", "overlay2": "#9399b2",
+    "overlay1": "#7f849c", "overlay0": "#6c7086",
+    "green":    "#a6e3a1", "teal":     "#94e2d5", "red":      "#f38ba8",
+    "crust":    "#11111b",
+}
+
+LANGUAGE_COLORS = {
+    "Python":     "#3572A5", "JavaScript": "#f1e05a", "TypeScript": "#3178c6",
+    "Go":         "#00ADD8", "Rust":       "#dea584", "Lua":        "#5d8fd1",
+    "Shell":      "#89e051", "Bash":       "#89e051", "Ruby":       "#cc3434",
+    "Java":       "#b07219", "C":          "#8a8a8a", "C++":        "#f34b7d",
+    "C#":         "#178600", "HTML":       "#e34c26", "CSS":        "#a06ed7",
+    "SCSS":       "#c6538c", "Vue":        "#41b883", "Swift":      "#F05138",
+    "Kotlin":     "#A97BFF", "Elixir":     "#9A6CCB", "Haskell":    "#a78bfa",
+    "Zig":        "#ec915c", "Nim":        "#ffc200", "Dart":       "#00B4AB",
+    "Markdown":   "#89b4fa", "Vim Script": "#199f4b", "Nix":        "#7e7eff",
+    "Fish":       "#4aae47", "Dockerfile": "#9caec4",
+}
 
 
 def preflight() -> None:
@@ -97,50 +118,107 @@ def scan_local_projects() -> list[dict]:
     return projects
 
 
+def name_cell(name: str) -> Text:
+    return Text(name, style=f"bold {CTP['text']}")
+
+
+def remote_cell(remote: str | None) -> Text:
+    if remote is None:
+        return Text("—", style=f"dim {CTP['overlay0']}")
+    return Text(remote, style=CTP["subtext0"])
+
+
+def lang_cell(lang: str) -> Text:
+    if lang == "-":
+        return Text("—", style=f"dim {CTP['overlay0']}")
+    color = LANGUAGE_COLORS.get(lang, CTP["overlay2"])
+    return Text(f"● {lang}", style=f"bold {color}")
+
+
+def vis_cell(visibility: str) -> Text:
+    visibility = visibility.lower()
+    if visibility == "public":
+        return Text(" PUBLIC ", style=f"bold {CTP['crust']} on {CTP['green']}")
+    return Text(" PRIVATE ", style=f"bold {CTP['crust']} on {CTP['red']}")
+
+
+def local_sync_cell(synced: bool) -> Text:
+    if synced:
+        return Text("●", style=f"bold {CTP['green']}")
+    return Text("○", style=CTP["overlay1"])
+
+
+def github_sync_cell(synced: bool) -> Text:
+    if synced:
+        return Text("●", style=f"bold {CTP['green']}")
+    return Text("☁", style=f"bold {CTP['teal']}")
+
+
 class ProjectsApp(App):
     TITLE = "opus-tui"
-    SUB_TITLE = "projects"
+    SUB_TITLE = "loading…"
+
+    ENABLE_COMMAND_PALETTE = False
 
     CSS = """
+    Screen {
+        background: $background;
+    }
+    Header {
+        background: $background;
+        color: $primary;
+        text-style: bold;
+    }
     Horizontal {
         height: 1fr;
     }
     DataTable {
         width: 1fr;
         height: 1fr;
-        border: round $panel-lighten-2;
+        border: heavy $surface;
+        border-title-color: $secondary;
+        border-title-style: bold;
+        border-title-align: left;
         margin: 0 1;
     }
     DataTable:focus {
-        border: round $accent;
+        border: heavy $primary;
+        border-title-color: $primary;
+    }
+    Footer {
+        background: $surface;
+        color: $foreground;
     }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
-        Binding("tab", "switch_pane", "Switch pane", show=True),
+        Binding("tab", "switch_pane", "Switch pane"),
+        Binding("r", "refresh", "Refresh"),
     ]
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Header(show_clock=True)
         with Horizontal():
             yield DataTable(id="local", cursor_type="row", zebra_stripes=True)
             yield DataTable(id="github", cursor_type="row", zebra_stripes=True)
         yield Footer()
 
     def on_mount(self) -> None:
+        self.theme = "catppuccin-mocha"
+
         local = self.query_one("#local", DataTable)
-        local.border_title = "Local — ~/Projects"
+        local.border_title = "  Local · ~/Projects "
         local.add_column(" ", key="sync", width=2)
         local.add_column("Name", key="name")
         local.add_column("Remote", key="remote")
         local.loading = True
 
         github = self.query_one("#github", DataTable)
-        github.border_title = "GitHub"
+        github.border_title = "  GitHub "
         github.add_column(" ", key="sync", width=2)
         github.add_column("Name", key="name")
-        github.add_column("Vis", key="vis", width=8)
+        github.add_column("Vis", key="vis", width=11)
         github.add_column("Lang", key="lang")
         github.loading = True
 
@@ -158,23 +236,26 @@ class ProjectsApp(App):
         local_owner_names = {p["github"] for p in local_projects if p["github"]}
 
         local_table = self.query_one("#local", DataTable)
+        local_table.clear()
         for proj in local_projects:
             synced = proj["github"] in github_owner_names
-            glyph = "●" if synced else "○"
-            remote = proj["github"] or "—"
-            local_table.add_row(glyph, proj["name"], remote)
+            local_table.add_row(
+                local_sync_cell(synced),
+                name_cell(proj["name"]),
+                remote_cell(proj["github"]),
+            )
         local_table.loading = False
 
         github_table = self.query_one("#github", DataTable)
+        github_table.clear()
         for repo in github_repos:
             synced = repo["nameWithOwner"] in local_owner_names
-            glyph = "●" if synced else "☁"
             lang = (repo.get("primaryLanguage") or {}).get("name") or "-"
             github_table.add_row(
-                glyph,
-                repo["name"],
-                repo["visibility"].lower(),
-                lang,
+                github_sync_cell(synced),
+                name_cell(repo["name"]),
+                vis_cell(repo["visibility"]),
+                lang_cell(lang),
             )
         github_table.loading = False
 
@@ -182,7 +263,7 @@ class ProjectsApp(App):
             1 for p in local_projects if p["github"] in github_owner_names
         )
         self.sub_title = (
-            f"{len(local_projects)} local · {len(github_repos)} on GitHub · "
+            f"{len(local_projects)} local · {len(github_repos)} on github · "
             f"{synced_count} synced"
         )
 
@@ -196,6 +277,13 @@ class ProjectsApp(App):
             tables[(idx + 1) % len(tables)].focus()
         else:
             tables[0].focus()
+
+    def action_refresh(self) -> None:
+        self.sub_title = "refreshing…"
+        for table in self.query(DataTable):
+            table.clear()
+            table.loading = True
+        self.load_data()
 
 
 def main() -> None:
