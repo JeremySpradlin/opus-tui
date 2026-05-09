@@ -49,12 +49,14 @@ GITHUB_REMOTE_RE = re.compile(
 )
 
 ASCII_TITLE = [
-    " ██████╗ ██████╗ ██╗   ██╗███████╗ ████████╗██╗   ██╗██╗",
-    "██╔═══██╗██╔══██╗██║   ██║██╔════╝ ╚══██╔══╝██║   ██║██║",
-    "██║   ██║██████╔╝██║   ██║███████╗    ██║   ██║   ██║██║",
-    "██║   ██║██╔═══╝ ██║   ██║╚════██║    ██║   ██║   ██║██║",
-    "╚██████╔╝██║     ╚██████╔╝███████║    ██║   ╚██████╔╝██║",
-    " ╚═════╝ ╚═╝      ╚═════╝ ╚══════╝    ╚═╝    ╚═════╝ ╚═╝",
+    " ██████╗  ██████╗  ██╗   ██╗ ███████╗",
+    "██╔═══██╗ ██╔══██╗ ██║   ██║ ██╔════╝",
+    "██║   ██║ ██║  ██║ ██║   ██║ ██║     ",
+    "██║   ██║ ██████╔╝ ██║   ██║ ███████╗",
+    "██║   ██║ ██╔═══╝  ██║   ██║ ╚════██║",
+    "██║   ██║ ██║      ██║   ██║ ╚════██║",
+    "╚██████╔╝ ██║      ╚██████╔╝ ███████║",
+    " ╚═════╝  ╚═╝       ╚═════╝  ╚══════╝",
 ]
 
 # Intentionally NOT themed: GitHub linguist colors are semantic and widely
@@ -137,12 +139,12 @@ class Banner(Vertical):
 
     DEFAULT_CSS = """
     Banner {
-        height: 10;
+        height: 12;
         padding: 1 2 0 2;
         background: $background;
     }
     Banner > #banner-ascii {
-        height: 6;
+        height: 8;
         background: transparent;
     }
     Banner > #banner-stats {
@@ -157,6 +159,8 @@ class Banner(Vertical):
     }
     """
 
+    _last_stats: tuple[str, int, int, int] | None = None
+
     def compose(self) -> ComposeResult:
         yield Static(id="banner-ascii")
         yield Static(id="banner-stats")
@@ -166,24 +170,52 @@ class Banner(Vertical):
         self.apply_theme()
         self.show_stats("local", 0, 0, 0)
 
+    def _content_width(self) -> int:
+        """Inner width available to banner content (Banner width minus padding)."""
+        return self.size.width - 4 if self.size.width else 80
+
     def apply_theme(self) -> None:
         """(Re)render the ASCII gradient using the app's current AppColors."""
         colors: AppColors = self.app._app_colors  # type: ignore[attr-defined]
-        gradient = colors.banner_gradient
-        # 6-line ASCII art; pair lines by gradient stop: [a,a,b,b,c,c]
-        line_colors = (gradient[0], gradient[0], gradient[1], gradient[1], gradient[2], gradient[2])
+        g = colors.banner_gradient
+        # 8-line ASCII art; gradient distributed 2/4/2 (symmetric).
+        line_colors = (g[0], g[0], g[1], g[1], g[1], g[1], g[2], g[2])
+
+        art_width = max(len(line) for line in ASCII_TITLE)
+        pad = " " * max(0, (self._content_width() - art_width) // 2)
+
         text = Text()
         for idx, line in enumerate(ASCII_TITLE):
-            text.append(line, style=f"bold {line_colors[idx]}")
+            text.append(pad + line, style=f"bold {line_colors[idx]}")
             if idx < len(ASCII_TITLE) - 1:
                 text.append("\n")
         self.query_one("#banner-ascii", Static).update(text)
 
+    def on_resize(self) -> None:
+        """Re-center on terminal resize."""
+        self.apply_theme()
+        self._reapply_stats()
+
+    def _reapply_stats(self) -> None:
+        """Re-render the cached stats line at current width. No-op if uncached."""
+        if self._last_stats is not None:
+            self.show_stats(*self._last_stats)
+
     def show_stats(self, view: str, local: int, github: int, synced: int) -> None:
+        self._last_stats = (view, local, github, synced)
         colors: AppColors = self.app._app_colors  # type: ignore[attr-defined]
         view_label = "  Local" if view == "local" else "  GitHub"
         view_color = colors.view_local if view == "local" else colors.view_github
+
+        # Build the visible string first to compute centering pad.
+        visible = (
+            f"your project switchboard    {view_label}  ·  "
+            f"{local} projects  ·  {github} on github  ·  {synced} synced"
+        )
+        pad = " " * max(0, (self._content_width() - len(visible)) // 2)
+
         stats = Text.assemble(
+            (pad, ""),
             ("your project switchboard", f"italic {colors.subtle}"),
             ("    ", ""),
             (view_label, f"bold {view_color}"),
