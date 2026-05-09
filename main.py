@@ -4,6 +4,9 @@ A "local project" is any direct subdir of ~/Projects/ that contains
 a .git directory. A local project is considered "synced" with GitHub
 when its origin remote points at a github.com URL whose owner/name
 matches one of the user's gh repos.
+
+Theming follows the active Omarchy theme (read via theme.py) and
+re-applies live within ~2 seconds when the user runs `omarchy theme set`.
 """
 
 import json
@@ -21,6 +24,16 @@ from textual.containers import Vertical
 from textual.reactive import reactive
 from textual.widgets import DataTable, Footer, Rule, Static
 
+from theme import (
+    AppColors,
+    FALLBACK_NAME,
+    FALLBACK_PALETTE,
+    THEME_NAME_FILE,
+    palette_to_app_colors,
+    palette_to_textual_theme,
+    read_omarchy,
+)
+
 PROJECTS_DIR = Path.home() / "Projects"
 
 REPO_FIELDS = [
@@ -35,14 +48,6 @@ GITHUB_REMOTE_RE = re.compile(
     r"(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
 )
 
-CTP = {
-    "text":     "#cdd6f4", "subtext0": "#a6adc8", "overlay2": "#9399b2",
-    "overlay1": "#7f849c", "overlay0": "#6c7086",
-    "green":    "#a6e3a1", "teal":     "#94e2d5", "red":      "#f38ba8",
-    "mauve":    "#cba6f7", "pink":     "#f5c2e7", "lavender": "#b4befe",
-    "crust":    "#11111b",
-}
-
 ASCII_TITLE = [
     " ██████╗ ██████╗ ██╗   ██╗███████╗ ████████╗██╗   ██╗██╗",
     "██╔═══██╗██╔══██╗██║   ██║██╔════╝ ╚══██╔══╝██║   ██║██║",
@@ -51,8 +56,10 @@ ASCII_TITLE = [
     "╚██████╔╝██║     ╚██████╔╝███████║    ██║   ╚██████╔╝██║",
     " ╚═════╝ ╚═╝      ╚═════╝ ╚══════╝    ╚═╝    ╚═════╝ ╚═╝",
 ]
-ASCII_GRADIENT = ["mauve", "mauve", "lavender", "lavender", "pink", "pink"]
 
+# Intentionally NOT themed: GitHub linguist colors are semantic and widely
+# recognized (Python yellow everywhere, Rust orange everywhere). Tinting
+# these with the active Omarchy palette would lose that recognizability.
 LANGUAGE_COLORS = {
     "Python":     "#3572A5", "JavaScript": "#f1e05a", "TypeScript": "#3178c6",
     "Go":         "#00ADD8", "Rust":       "#dea584", "Lua":        "#5d8fd1",
@@ -125,42 +132,6 @@ def scan_local_projects() -> list[dict]:
     return projects
 
 
-def name_cell(name: str) -> Text:
-    return Text(name, style=f"bold {CTP['text']}")
-
-
-def remote_cell(remote: str | None) -> Text:
-    if remote is None:
-        return Text("—", style=f"dim {CTP['overlay0']}")
-    return Text(remote, style=CTP["subtext0"])
-
-
-def lang_cell(lang: str) -> Text:
-    if lang == "-":
-        return Text("—", style=f"dim {CTP['overlay0']}")
-    color = LANGUAGE_COLORS.get(lang, CTP["overlay2"])
-    return Text(f"● {lang}", style=f"bold {color}")
-
-
-def vis_cell(visibility: str) -> Text:
-    visibility = visibility.lower()
-    if visibility == "public":
-        return Text(" PUBLIC ", style=f"bold {CTP['crust']} on {CTP['green']}")
-    return Text(" PRIVATE ", style=f"bold {CTP['crust']} on {CTP['red']}")
-
-
-def local_sync_cell(synced: bool) -> Text:
-    if synced:
-        return Text("●", style=f"bold {CTP['green']}")
-    return Text("○", style=CTP["overlay1"])
-
-
-def github_sync_cell(synced: bool) -> Text:
-    if synced:
-        return Text("●", style=f"bold {CTP['green']}")
-    return Text("☁", style=f"bold {CTP['teal']}")
-
-
 class Banner(Vertical):
     """Top banner: ASCII title with gradient, tagline + stats, heavy rule."""
 
@@ -192,29 +163,37 @@ class Banner(Vertical):
         yield Rule(line_style="heavy")
 
     def on_mount(self) -> None:
-        ascii_text = Text()
-        for idx, line in enumerate(ASCII_TITLE):
-            color = CTP[ASCII_GRADIENT[idx]]
-            ascii_text.append(line, style=f"bold {color}")
-            if idx < len(ASCII_TITLE) - 1:
-                ascii_text.append("\n")
-        self.query_one("#banner-ascii", Static).update(ascii_text)
+        self.apply_theme()
         self.show_stats("local", 0, 0, 0)
 
+    def apply_theme(self) -> None:
+        """(Re)render the ASCII gradient using the app's current AppColors."""
+        colors: AppColors = self.app._app_colors  # type: ignore[attr-defined]
+        gradient = colors.banner_gradient
+        # 6-line ASCII art; pair lines by gradient stop: [a,a,b,b,c,c]
+        line_colors = (gradient[0], gradient[0], gradient[1], gradient[1], gradient[2], gradient[2])
+        text = Text()
+        for idx, line in enumerate(ASCII_TITLE):
+            text.append(line, style=f"bold {line_colors[idx]}")
+            if idx < len(ASCII_TITLE) - 1:
+                text.append("\n")
+        self.query_one("#banner-ascii", Static).update(text)
+
     def show_stats(self, view: str, local: int, github: int, synced: int) -> None:
+        colors: AppColors = self.app._app_colors  # type: ignore[attr-defined]
         view_label = "  Local" if view == "local" else "  GitHub"
-        view_color = CTP["green"] if view == "local" else CTP["teal"]
+        view_color = colors.view_local if view == "local" else colors.view_github
         stats = Text.assemble(
-            ("your project switchboard", f"italic {CTP['overlay2']}"),
+            ("your project switchboard", f"italic {colors.subtle}"),
             ("    ", ""),
             (view_label, f"bold {view_color}"),
-            ("  ·  ", CTP["overlay1"]),
-            (str(local), f"bold {CTP['text']}"),
-            (" projects  ·  ", CTP["overlay1"]),
-            (str(github), f"bold {CTP['text']}"),
-            (" on github  ·  ", CTP["overlay1"]),
-            (str(synced), f"bold {CTP['green']}"),
-            (" synced", CTP["overlay1"]),
+            ("  ·  ", colors.muted_rule),
+            (str(local), f"bold {colors.text}"),
+            (" projects  ·  ", colors.muted_rule),
+            (str(github), f"bold {colors.text}"),
+            (" on github  ·  ", colors.muted_rule),
+            (str(synced), f"bold {colors.glyph_synced}"),
+            (" synced", colors.muted_rule),
         )
         self.query_one("#banner-stats", Static).update(stats)
 
@@ -253,6 +232,10 @@ class ProjectsApp(App):
         super().__init__()
         self.local_projects: list[dict] = []
         self.github_repos: list[dict] = []
+        # Default colors so widgets mounting before _reload_theme have something
+        # to read. _reload_theme overwrites in on_mount.
+        self._app_colors: AppColors = palette_to_app_colors(FALLBACK_PALETTE)
+        self._omarchy_mtime: float | None = None
 
     def compose(self) -> ComposeResult:
         yield Banner()
@@ -265,12 +248,84 @@ class ProjectsApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.theme = "catppuccin-mocha"
+        self._reload_theme()
         self._setup_columns_for_view("local")
         table = self.query_one("#projects", DataTable)
         table.loading = True
         table.focus()
+        self.set_interval(2.0, self._poll_theme)
         self.load_data()
+
+    # ── theme reload pipeline ──────────────────────────────────────────────
+
+    def _poll_theme(self) -> None:
+        try:
+            mtime = THEME_NAME_FILE.stat().st_mtime
+        except OSError:
+            mtime = None
+        if mtime != self._omarchy_mtime:
+            self._reload_theme()
+
+    def _reload_theme(self) -> None:
+        result = read_omarchy()
+        name, palette = result if result else (FALLBACK_NAME, FALLBACK_PALETTE)
+
+        try:
+            self._omarchy_mtime = THEME_NAME_FILE.stat().st_mtime
+        except OSError:
+            self._omarchy_mtime = None
+
+        self._app_colors = palette_to_app_colors(palette)
+        self.register_theme(palette_to_textual_theme(palette, name))
+
+        if self.theme != name:
+            self.theme = name
+        else:
+            # Same name, palette possibly mutated. Force re-render via toggle.
+            self.theme = "textual-dark"
+            self.theme = name
+
+        try:
+            self.query_one(Banner).apply_theme()
+        except Exception:
+            pass  # Banner may not be mounted on first call from on_mount
+
+        if self.local_projects or self.github_repos:
+            self._render_view()
+
+    # ── cell rendering ─────────────────────────────────────────────────────
+
+    def _name_cell(self, name: str) -> Text:
+        return Text(name, style=f"bold {self._app_colors.text}")
+
+    def _remote_cell(self, remote: str | None) -> Text:
+        if remote is None:
+            return Text("—", style=f"dim {self._app_colors.dim}")
+        return Text(remote, style=self._app_colors.subtle)
+
+    def _lang_cell(self, lang: str) -> Text:
+        if lang == "-":
+            return Text("—", style=f"dim {self._app_colors.dim}")
+        color = LANGUAGE_COLORS.get(lang, self._app_colors.lang_fallback)
+        return Text(f"● {lang}", style=f"bold {color}")
+
+    def _vis_cell(self, visibility: str) -> Text:
+        c = self._app_colors
+        if visibility.lower() == "public":
+            return Text(" PUBLIC ", style=f"bold {c.badge_text} on {c.badge_public_bg}")
+        return Text(" PRIVATE ", style=f"bold {c.badge_text} on {c.badge_private_bg}")
+
+    def _local_sync_cell(self, synced: bool) -> Text:
+        if synced:
+            return Text("●", style=f"bold {self._app_colors.glyph_synced}")
+        return Text("○", style=self._app_colors.glyph_local_only)
+
+    def _github_sync_cell(self, synced: bool) -> Text:
+        if synced:
+            return Text("●", style=f"bold {self._app_colors.glyph_synced}")
+        return Text("☁", style=f"bold {self._app_colors.glyph_github_only}")
+
+    # ── data load + render ─────────────────────────────────────────────────
 
     def _setup_columns_for_view(self, view: str) -> None:
         table = self.query_one("#projects", DataTable)
@@ -320,19 +375,19 @@ class ProjectsApp(App):
             for proj in self.local_projects:
                 synced = proj["github"] in github_owner_names
                 table.add_row(
-                    local_sync_cell(synced),
-                    name_cell(proj["name"]),
-                    remote_cell(proj["github"]),
+                    self._local_sync_cell(synced),
+                    self._name_cell(proj["name"]),
+                    self._remote_cell(proj["github"]),
                 )
         else:
             for repo in self.github_repos:
                 synced = repo["nameWithOwner"] in local_owner_names
                 lang = (repo.get("primaryLanguage") or {}).get("name") or "-"
                 table.add_row(
-                    github_sync_cell(synced),
-                    name_cell(repo["name"]),
-                    vis_cell(repo["visibility"]),
-                    lang_cell(lang),
+                    self._github_sync_cell(synced),
+                    self._name_cell(repo["name"]),
+                    self._vis_cell(repo["visibility"]),
+                    self._lang_cell(lang),
                 )
 
     def watch_view(self, _old: str, _new: str) -> None:
