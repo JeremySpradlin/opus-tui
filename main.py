@@ -1,20 +1,29 @@
-"""Textual TUI for browsing the authenticated user's GitHub repos.
+"""Textual TUI for managing projects: local + GitHub side-by-side.
 
-Same gh-CLI plumbing as before, fronted by a Textual DataTable.
+A "local project" is any direct subdir of ~/Projects/ that contains
+a .git directory. A local project is considered "synced" with GitHub
+when its origin remote points at a github.com URL whose owner/name
+matches one of the user's gh repos.
 """
 
 import json
+import re
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import Horizontal
 from textual.widgets import DataTable, Footer, Header
+
+PROJECTS_DIR = Path.home() / "Projects"
 
 REPO_FIELDS = [
     "name",
+    "nameWithOwner",
     "description",
     "primaryLanguage",
     "stargazerCount",
@@ -23,6 +32,11 @@ REPO_FIELDS = [
     "isFork",
     "isArchived",
 ]
+
+GITHUB_REMOTE_RE = re.compile(
+    r"^(?:https?://github\.com/|git@github\.com:)"
+    r"(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
+)
 
 
 def preflight() -> None:
@@ -37,8 +51,11 @@ def preflight() -> None:
     if result.returncode != 0:
         sys.exit("error: `gh` is not authenticated. Run `gh auth login` first.")
 
+    if not PROJECTS_DIR.is_dir():
+        sys.exit(f"error: projects directory {PROJECTS_DIR} does not exist.")
 
-def fetch_repos(limit: int = 100) -> list[dict]:
+
+def fetch_github_repos(limit: int = 1000) -> list[dict]:
     result = subprocess.run(
         [
             "gh", "repo", "list",
@@ -52,58 +69,138 @@ def fetch_repos(limit: int = 100) -> list[dict]:
     return json.loads(result.stdout)
 
 
-def repo_row(repo: dict) -> tuple[str, str, str, int, str]:
-    name = repo["name"]
-    visibility = repo["visibility"].lower()
-    lang = (repo.get("primaryLanguage") or {}).get("name") or "-"
-    stars = repo["stargazerCount"]
-    updated = repo["updatedAt"][:10]
-    return name, visibility, lang, stars, updated
+def github_remote_for(project_path: Path) -> str | None:
+    """Return 'owner/repo' if origin points at github.com, else None."""
+    result = subprocess.run(
+        ["git", "-C", str(project_path), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    match = GITHUB_REMOTE_RE.match(result.stdout.strip())
+    if not match:
+        return None
+    return f"{match['owner']}/{match['repo']}"
 
 
-class ReposApp(App):
+def scan_local_projects() -> list[dict]:
+    projects = []
+    for entry in sorted(PROJECTS_DIR.iterdir(), key=lambda p: p.name.lower()):
+        if not entry.is_dir() or not (entry / ".git").exists():
+            continue
+        projects.append({
+            "name": entry.name,
+            "path": entry,
+            "github": github_remote_for(entry),
+        })
+    return projects
+
+
+class ProjectsApp(App):
     TITLE = "opus-tui"
-    SUB_TITLE = "your GitHub repos"
+    SUB_TITLE = "projects"
+
+    CSS = """
+    Horizontal {
+        height: 1fr;
+    }
+    DataTable {
+        width: 1fr;
+        height: 1fr;
+        border: round $panel-lighten-2;
+        margin: 0 1;
+    }
+    DataTable:focus {
+        border: round $accent;
+    }
+    """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
-        Binding("s", "sort_stars", "Sort by stars"),
+        Binding("tab", "switch_pane", "Switch pane", show=True),
     ]
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield DataTable(cursor_type="row", zebra_stripes=True)
+        with Horizontal():
+            yield DataTable(id="local", cursor_type="row", zebra_stripes=True)
+            yield DataTable(id="github", cursor_type="row", zebra_stripes=True)
         yield Footer()
 
     def on_mount(self) -> None:
-        table = self.query_one(DataTable)
-        table.add_column("Name", key="name", width=30)
-        table.add_column("Vis", key="vis", width=8)
-        table.add_column("Lang", key="lang", width=14)
-        table.add_column("Stars", key="stars", width=7)
-        table.add_column("Updated", key="updated", width=12)
-        table.loading = True
-        self.load_repos()
+        local = self.query_one("#local", DataTable)
+        local.border_title = "Local — ~/Projects"
+        local.add_column(" ", key="sync", width=2)
+        local.add_column("Name", key="name")
+        local.add_column("Remote", key="remote")
+        local.loading = True
+
+        github = self.query_one("#github", DataTable)
+        github.border_title = "GitHub"
+        github.add_column(" ", key="sync", width=2)
+        github.add_column("Name", key="name")
+        github.add_column("Vis", key="vis", width=8)
+        github.add_column("Lang", key="lang")
+        github.loading = True
+
+        local.focus()
+        self.load_data()
 
     @work(thread=True)
-    def load_repos(self) -> None:
-        repos = fetch_repos()
-        self.call_from_thread(self.populate, repos)
+    def load_data(self) -> None:
+        local_projects = scan_local_projects()
+        github_repos = fetch_github_repos()
+        self.call_from_thread(self.populate, local_projects, github_repos)
 
-    def populate(self, repos: list[dict]) -> None:
-        table = self.query_one(DataTable)
-        for repo in repos:
-            table.add_row(*repo_row(repo))
-        table.loading = False
-        self.sub_title = f"{len(repos)} repos"
+    def populate(self, local_projects: list[dict], github_repos: list[dict]) -> None:
+        github_owner_names = {r["nameWithOwner"] for r in github_repos}
+        local_owner_names = {p["github"] for p in local_projects if p["github"]}
 
-    def action_sort_stars(self) -> None:
-        self.query_one(DataTable).sort("stars", reverse=True)
+        local_table = self.query_one("#local", DataTable)
+        for proj in local_projects:
+            synced = proj["github"] in github_owner_names
+            glyph = "●" if synced else "○"
+            remote = proj["github"] or "—"
+            local_table.add_row(glyph, proj["name"], remote)
+        local_table.loading = False
+
+        github_table = self.query_one("#github", DataTable)
+        for repo in github_repos:
+            synced = repo["nameWithOwner"] in local_owner_names
+            glyph = "●" if synced else "☁"
+            lang = (repo.get("primaryLanguage") or {}).get("name") or "-"
+            github_table.add_row(
+                glyph,
+                repo["name"],
+                repo["visibility"].lower(),
+                lang,
+            )
+        github_table.loading = False
+
+        synced_count = sum(
+            1 for p in local_projects if p["github"] in github_owner_names
+        )
+        self.sub_title = (
+            f"{len(local_projects)} local · {len(github_repos)} on GitHub · "
+            f"{synced_count} synced"
+        )
+
+    def action_switch_pane(self) -> None:
+        tables = list(self.query(DataTable))
+        if not tables:
+            return
+        focused = self.focused
+        if focused in tables:
+            idx = tables.index(focused)
+            tables[(idx + 1) % len(tables)].focus()
+        else:
+            tables[0].focus()
 
 
 def main() -> None:
     preflight()
-    ReposApp().run()
+    ProjectsApp().run()
 
 
 if __name__ == "__main__":
