@@ -305,6 +305,7 @@ class ProjectsApp(App):
         self._github_set: set[str] = set()
         self._local_set: set[str] = set()
         self._last_highlighted: int | None = None
+        self._github_loaded: bool = False
 
     def compose(self) -> ComposeResult:
         yield Banner()
@@ -417,13 +418,13 @@ class ProjectsApp(App):
         pad = max(0, self._list_content_width() - content.cell_len - 1)
         return Text.assemble(Text(" " * pad), content)
 
-    def _populate_list(self) -> None:
+    def _update_banner_stats(self) -> None:
+        """Recompute derived sets and refresh the banner's stats line."""
         self._github_set = {r["nameWithOwner"] for r in self.github_repos}
         self._local_set = {p["github"] for p in self.local_projects if p["github"]}
         synced_count = sum(
             1 for p in self.local_projects if p.get("github") in self._github_set
         )
-
         self.query_one(Banner).show_stats(
             self.view,
             len(self.local_projects),
@@ -431,11 +432,24 @@ class ProjectsApp(App):
             synced_count,
         )
 
-        items = self.local_projects if self.view == "local" else self.github_repos
+    def _populate_list(self) -> None:
+        self._update_banner_stats()
+
         plist = self.query_one(OptionList)
+
+        # GitHub view requested but the gh fetch hasn't returned yet.
+        if self.view == "github" and not self._github_loaded:
+            plist.clear_options()
+            plist.loading = True
+            self._last_highlighted = None
+            self._show_loading_detail()
+            return
+
+        plist.loading = False
         plist.clear_options()
         self._last_highlighted = None
 
+        items = self.local_projects if self.view == "local" else self.github_repos
         if not items:
             self._show_empty_detail()
             return
@@ -524,6 +538,12 @@ class ProjectsApp(App):
             Text("(no projects)", style=f"dim {c.dim}")
         )
 
+    def _show_loading_detail(self) -> None:
+        c = self._app_colors
+        self.query_one(DetailPanel).update(
+            Text("loading github repos…", style=f"italic {c.subtle}")
+        )
+
     def _show_local_detail(self, project: dict) -> None:
         c = self._app_colors
         path = str(project["path"])
@@ -589,17 +609,39 @@ class ProjectsApp(App):
 
     @work(thread=True)
     def load_data(self) -> None:
+        # Local-first split: post local results as soon as the scan returns
+        # so the list appears in ~200ms, then post github when the slower
+        # network call completes.
         local_projects = scan_local_projects()
+        self.call_from_thread(self._on_local_loaded, local_projects)
         github_repos = fetch_github_repos()
-        self.call_from_thread(self._on_data_loaded, local_projects, github_repos)
+        self.call_from_thread(self._on_github_loaded, github_repos)
 
-    def _on_data_loaded(
-        self, local_projects: list[dict], github_repos: list[dict]
-    ) -> None:
+    def _on_local_loaded(self, local_projects: list[dict]) -> None:
         self.local_projects = local_projects
+        if self.view == "local":
+            self.query_one(OptionList).loading = False
+            self._populate_list()
+        else:
+            # User toggled to github view before local arrived. Just refresh
+            # banner stats; populate logic owns the github loading state.
+            self._update_banner_stats()
+
+    def _on_github_loaded(self, github_repos: list[dict]) -> None:
         self.github_repos = github_repos
-        self._populate_list()
-        self.query_one(OptionList).loading = False
+        self._github_loaded = True
+
+        if self.view == "github":
+            self.query_one(OptionList).loading = False
+            self._populate_list()
+            return
+
+        # Local view: update sync glyphs (○ → ●) in place so the user's
+        # cursor and scroll position are preserved.
+        self._update_banner_stats()
+        self._refresh_list_rows()
+        if self._last_highlighted is not None:
+            self._update_detail_for_index(self._last_highlighted)
 
     # ── reactive watchers + actions ────────────────────────────────────────
 
@@ -614,6 +656,7 @@ class ProjectsApp(App):
         plist = self.query_one(OptionList)
         plist.clear_options()
         plist.loading = True
+        self._github_loaded = False
         self.load_data()
 
     def on_resize(self) -> None:
