@@ -132,6 +132,38 @@ def read_branch(project_path: Path) -> str | None:
     return head[:7] if head else None
 
 
+def git_status_summary(project_path: Path) -> dict | None:
+    """Run `git status --porcelain --branch` and parse dirty / ahead / behind.
+
+    Returns {"dirty": int, "ahead": int|None, "behind": int|None} or None
+    on error. ahead/behind are None if the branch has no upstream tracking.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(project_path), "status", "--porcelain", "--branch"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    lines = result.stdout.splitlines()
+    branch_line = lines[0] if lines else ""
+    ahead = behind = 0
+    has_upstream = "..." in branch_line
+    if has_upstream and "[" in branch_line and "]" in branch_line:
+        bracket = branch_line[branch_line.index("[") + 1:branch_line.index("]")]
+        for part in bracket.split(","):
+            part = part.strip()
+            if part.startswith("ahead "):
+                ahead = int(part[6:])
+            elif part.startswith("behind "):
+                behind = int(part[7:])
+    dirty = sum(1 for line in lines[1:] if line.strip())
+    return {
+        "dirty": dirty,
+        "ahead": ahead if has_upstream else None,
+        "behind": behind if has_upstream else None,
+    }
+
+
 def scan_local_projects() -> list[dict]:
     projects = []
     for entry in sorted(PROJECTS_DIR.iterdir(), key=lambda p: p.name.lower()):
@@ -217,7 +249,7 @@ class Banner(Vertical):
 
         visible = (
             f"your project switchboard    {view_label}  ·  "
-            f"{local} projects  ·  {github} on github  ·  {synced} synced"
+            f"{local} projects  ·  {github} on github  ·  {synced} linked"
         )
         pad = " " * max(0, (self._content_width() - len(visible)) // 2)
 
@@ -232,7 +264,7 @@ class Banner(Vertical):
             (str(github), f"bold {colors.text}"),
             (" on github  ·  ", colors.muted_rule),
             (str(synced), f"bold {colors.glyph_synced}"),
-            (" synced", colors.muted_rule),
+            (" linked", colors.muted_rule),
         )
         self.query_one("#banner-stats", Static).update(stats)
 
@@ -544,7 +576,14 @@ class ProjectsApp(App):
             Text("loading github repos…", style=f"italic {c.subtle}")
         )
 
+    def _ensure_git_status(self, project: dict) -> None:
+        """Lazily compute and cache git status info on the project dict."""
+        if "_status" in project:
+            return
+        project["_status"] = git_status_summary(project["path"])
+
     def _show_local_detail(self, project: dict) -> None:
+        self._ensure_git_status(project)
         c = self._app_colors
         path = str(project["path"])
         home = str(Path.home())
@@ -553,7 +592,34 @@ class ProjectsApp(App):
 
         github = project.get("github") or "—"
         branch = project.get("branch") or "?"
-        synced = project.get("github") in self._github_set
+
+        # changes line
+        status = project.get("_status")
+        if status is None:
+            changes_text = Text("?", style=c.muted_rule)
+        elif status["dirty"] == 0:
+            changes_text = Text("clean", style=c.muted_rule)
+        else:
+            n = status["dirty"]
+            changes_text = Text(
+                f"{n} {'change' if n == 1 else 'changes'}",
+                style=f"bold {c.text}",
+            )
+
+        # remote line (ahead/behind upstream)
+        if status is None or status["ahead"] is None:
+            remote_text = Text("no upstream", style=c.muted_rule)
+        else:
+            ahead, behind = status["ahead"], status["behind"]
+            if ahead == 0 and behind == 0:
+                remote_text = Text("up to date", style=c.muted_rule)
+            else:
+                parts = []
+                if ahead > 0:
+                    parts.append(f"↑{ahead}")
+                if behind > 0:
+                    parts.append(f"↓{behind}")
+                remote_text = Text(" ".join(parts), style=f"bold {c.text}")
 
         body = Text()
         body.append(project["name"], style=f"bold {c.text}")
@@ -564,14 +630,9 @@ class ProjectsApp(App):
         body.append("\n")
         body.append_text(self._kv("branch", Text(branch, style=c.subtle)))
         body.append("\n")
-        body.append_text(
-            self._kv(
-                "status",
-                Text("synced", style=f"bold {c.glyph_synced}")
-                if synced
-                else Text("local-only", style=c.muted_rule),
-            )
-        )
+        body.append_text(self._kv("changes", changes_text))
+        body.append("\n")
+        body.append_text(self._kv("remote", remote_text))
         self.query_one(DetailPanel).update(body)
 
     def _show_github_detail(self, repo: dict) -> None:
