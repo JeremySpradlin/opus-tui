@@ -59,6 +59,8 @@ ASCII_TITLE = [
     " ╚═════╝  ╚═╝       ╚═════╝  ╚══════╝",
 ]
 
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
 # Intentionally NOT themed: GitHub linguist colors are semantic and widely
 # recognized (Python yellow everywhere, Rust orange everywhere). Tinting
 # these with the active Omarchy palette would lose that recognizability.
@@ -323,6 +325,7 @@ class ProjectsApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("g", "toggle_view", "Switch view"),
+        Binding("c", "clone", "Clone"),
         Binding("r", "refresh", "Refresh"),
     ]
 
@@ -338,6 +341,10 @@ class ProjectsApp(App):
         self._local_set: set[str] = set()
         self._last_highlighted: int | None = None
         self._github_loaded: bool = False
+        # Clone-in-progress state. _cloning_repo_index points into github_repos.
+        self._cloning_repo_index: int | None = None
+        self._spinner_frame: int = 0
+        self._spinner_timer = None  # set_interval handle
 
     def compose(self) -> ComposeResult:
         yield Banner()
@@ -450,6 +457,30 @@ class ProjectsApp(App):
         pad = max(0, self._list_content_width() - content.cell_len - 1)
         return Text.assemble(Text(" " * pad), content)
 
+    def _cloning_row(self, repo: dict, focused: bool) -> Text:
+        """Row prompt for a repo currently being cloned (animated spinner)."""
+        c = self._app_colors
+        spinner = SPINNER_FRAMES[self._spinner_frame]
+        arrow = Text("▸ " if focused else "  ", style=f"bold {c.view_github}")
+        glyph = Text(spinner, style=f"bold {c.glyph_github_only}")
+        content = Text.assemble(
+            arrow,
+            glyph,
+            "  ",
+            Text(repo["name"], style=f"bold {c.text}"),
+        )
+        pad = max(0, self._list_content_width() - content.cell_len - 1)
+        return Text.assemble(Text(" " * pad), content)
+
+    def _row_for_index(self, idx: int, focused: bool) -> Text:
+        """Render any list row, special-casing the cloning one if applicable."""
+        items = self.local_projects if self.view == "local" else self.github_repos
+        if not (0 <= idx < len(items)):
+            return Text()
+        if self.view == "github" and idx == self._cloning_repo_index:
+            return self._cloning_row(items[idx], focused)
+        return self._list_row(items[idx], self.view, focused)
+
     def _update_banner_stats(self) -> None:
         """Recompute derived sets and refresh the banner's stats line."""
         self._github_set = {r["nameWithOwner"] for r in self.github_repos}
@@ -509,11 +540,11 @@ class ProjectsApp(App):
             plist = self.query_one(OptionList)
         except Exception:
             return
-        for idx, item in enumerate(items):
+        for idx in range(len(items)):
             focused = idx == self._last_highlighted
             try:
                 plist.replace_option_prompt_at_index(
-                    idx, self._list_row(item, self.view, focused)
+                    idx, self._row_for_index(idx, focused)
                 )
             except Exception:
                 pass
@@ -526,26 +557,16 @@ class ProjectsApp(App):
         # Remove arrow from previously focused row.
         if self._last_highlighted is not None and self._last_highlighted != idx:
             try:
-                items = (
-                    self.local_projects
-                    if self.view == "local"
-                    else self.github_repos
-                )
-                old_item = items[self._last_highlighted]
                 plist.replace_option_prompt_at_index(
                     self._last_highlighted,
-                    self._list_row(old_item, self.view, focused=False),
+                    self._row_for_index(self._last_highlighted, focused=False),
                 )
             except IndexError:
                 pass
 
         # Apply arrow to newly focused row.
-        items = self.local_projects if self.view == "local" else self.github_repos
         try:
-            new_item = items[idx]
-            plist.replace_option_prompt_at_index(
-                idx, self._list_row(new_item, self.view, focused=True)
-            )
+            plist.replace_option_prompt_at_index(idx, self._row_for_index(idx, focused=True))
         except IndexError:
             pass
 
@@ -640,6 +661,28 @@ class ProjectsApp(App):
         synced = repo["nameWithOwner"] in self._local_set
         lang = (repo.get("primaryLanguage") or {}).get("name") or "-"
 
+        is_cloning = (
+            self._cloning_repo_index is not None
+            and 0 <= self._cloning_repo_index < len(self.github_repos)
+            and self.github_repos[self._cloning_repo_index] is repo
+        )
+
+        if is_cloning:
+            spinner = SPINNER_FRAMES[self._spinner_frame]
+            target = str(PROJECTS_DIR / repo["name"])
+            home = str(Path.home())
+            if target.startswith(home):
+                target = "~" + target[len(home):]
+            status_text = Text.assemble(
+                (spinner + " ", f"bold {c.glyph_github_only}"),
+                ("cloning to ", c.subtle),
+                (target, f"italic {c.text}"),
+            )
+        elif synced:
+            status_text = Text("cloned locally", style=f"bold {c.glyph_synced}")
+        else:
+            status_text = Text("not cloned", style=f"bold {c.glyph_github_only}")
+
         body = Text()
         body.append(repo["name"], style=f"bold {c.text}")
         body.append("\n")
@@ -649,14 +692,7 @@ class ProjectsApp(App):
         body.append("\n")
         body.append_text(self._kv("language", self._lang_cell(lang)))
         body.append("\n")
-        body.append_text(
-            self._kv(
-                "status",
-                Text("cloned locally", style=f"bold {c.glyph_synced}")
-                if synced
-                else Text("not cloned", style=f"bold {c.glyph_github_only}"),
-            )
-        )
+        body.append_text(self._kv("status", status_text))
         self.query_one(DetailPanel).update(body)
 
     def _kv(self, key: str, value: Text) -> Text:
@@ -719,6 +755,172 @@ class ProjectsApp(App):
         plist.loading = True
         self._github_loaded = False
         self.load_data()
+
+    # ── clone flow ─────────────────────────────────────────────────────────
+
+    def action_clone(self) -> None:
+        if self.view != "github":
+            self.notify("Switch to GitHub view (g) first", severity="information")
+            return
+        if self._cloning_repo_index is not None:
+            self.notify("A clone is already in progress", severity="warning")
+            return
+        if self._last_highlighted is None or not self.github_repos:
+            return
+        idx = self._last_highlighted
+        if not (0 <= idx < len(self.github_repos)):
+            return
+        repo = self.github_repos[idx]
+        owner_name = repo["nameWithOwner"]
+
+        # Already cloned: smart-jump to the local project instead.
+        if owner_name in self._local_set:
+            self._jump_to_local_for_remote(owner_name)
+            return
+
+        target = PROJECTS_DIR / repo["name"]
+        if target.exists():
+            self.notify(
+                f"~/Projects/{repo['name']} already exists; refusing to overwrite",
+                severity="warning",
+                timeout=5,
+            )
+            return
+
+        self._cloning_repo_index = idx
+        self._start_spinner()
+        # Initial render of the cloning state for both row and detail.
+        try:
+            plist = self.query_one(OptionList)
+            plist.replace_option_prompt_at_index(
+                idx, self._cloning_row(repo, idx == self._last_highlighted)
+            )
+        except Exception:
+            pass
+        if self._last_highlighted == idx:
+            self._show_github_detail(repo)
+        self.clone_repo(owner_name, str(target), idx)
+
+    @work(thread=True)
+    def clone_repo(self, owner_name: str, target: str, idx: int) -> None:
+        result = subprocess.run(
+            ["gh", "repo", "clone", owner_name, target],
+            capture_output=True, text=True,
+        )
+        self.call_from_thread(
+            self._on_clone_done,
+            owner_name,
+            target,
+            idx,
+            result.returncode == 0,
+            (result.stderr or result.stdout).strip(),
+        )
+
+    def _on_clone_done(
+        self, owner_name: str, target: str, idx: int, success: bool, err: str
+    ) -> None:
+        self._stop_spinner()
+        self._cloning_repo_index = None
+
+        if success:
+            self.notify(f"Cloned {owner_name}", severity="information", timeout=3)
+            self._refresh_after_clone(target)
+            return
+
+        # Failure: restore the row + detail to their pre-clone state.
+        try:
+            plist = self.query_one(OptionList)
+            if 0 <= idx < len(self.github_repos):
+                focused = idx == self._last_highlighted
+                plist.replace_option_prompt_at_index(
+                    idx, self._list_row(self.github_repos[idx], "github", focused)
+                )
+        except Exception:
+            pass
+        if self._last_highlighted is not None:
+            self._update_detail_for_index(self._last_highlighted)
+        self.notify(f"Clone failed: {err[:120]}", severity="error", timeout=6)
+
+    @work(thread=True)
+    def _refresh_after_clone(self, target: str) -> None:
+        local_projects = scan_local_projects()
+        self.call_from_thread(self._post_clone_local_loaded, local_projects, target)
+
+    def _post_clone_local_loaded(
+        self, local_projects: list[dict], target: str
+    ) -> None:
+        self.local_projects = local_projects
+        target_path = Path(target)
+        new_idx = next(
+            (i for i, p in enumerate(local_projects) if p["path"] == target_path),
+            None,
+        )
+        # Switching the view triggers watch_view → _populate_list (sets cursor to 0).
+        self.view = "local"
+        if new_idx is not None and new_idx > 0:
+            def _select_new() -> None:
+                try:
+                    plist = self.query_one(OptionList)
+                    if 0 <= new_idx < plist.option_count:
+                        plist.highlighted = new_idx
+                except Exception:
+                    pass
+            self.call_after_refresh(_select_new)
+
+    def _jump_to_local_for_remote(self, owner_name: str) -> None:
+        new_idx = next(
+            (i for i, p in enumerate(self.local_projects)
+             if p.get("github") == owner_name),
+            None,
+        )
+        if new_idx is None:
+            self.notify(
+                f"Couldn't locate {owner_name} in local list",
+                severity="warning",
+            )
+            return
+        self.view = "local"
+        if new_idx > 0:
+            def _select() -> None:
+                try:
+                    plist = self.query_one(OptionList)
+                    if 0 <= new_idx < plist.option_count:
+                        plist.highlighted = new_idx
+                except Exception:
+                    pass
+            self.call_after_refresh(_select)
+
+    # ── clone spinner ──────────────────────────────────────────────────────
+
+    def _start_spinner(self) -> None:
+        self._spinner_frame = 0
+        if self._spinner_timer is None:
+            self._spinner_timer = self.set_interval(0.08, self._tick_spinner)
+
+    def _stop_spinner(self) -> None:
+        if self._spinner_timer is not None:
+            self._spinner_timer.stop()
+            self._spinner_timer = None
+        self._spinner_frame = 0
+
+    def _tick_spinner(self) -> None:
+        self._spinner_frame = (self._spinner_frame + 1) % len(SPINNER_FRAMES)
+        idx = self._cloning_repo_index
+        if idx is None or self.view != "github":
+            return
+        # Update the cloning row's prompt
+        try:
+            plist = self.query_one(OptionList)
+            if 0 <= idx < len(self.github_repos):
+                focused = idx == self._last_highlighted
+                plist.replace_option_prompt_at_index(
+                    idx, self._cloning_row(self.github_repos[idx], focused)
+                )
+        except Exception:
+            pass
+        # If the user is looking at the cloning project, update the detail too
+        if self._last_highlighted == idx and 0 <= idx < len(self.github_repos):
+            self._show_github_detail(self.github_repos[idx])
 
     def on_resize(self) -> None:
         """Re-render right-padded list rows when the layout reflows."""
