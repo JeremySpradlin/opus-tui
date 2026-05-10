@@ -17,12 +17,12 @@ import sys
 from pathlib import Path
 
 from rich.text import Text
-from textual import work
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
-from textual.widgets import DataTable, Footer, Rule, Static
+from textual.widgets import Footer, OptionList, Rule, Static
 
 from theme import (
     AppColors,
@@ -121,6 +121,17 @@ def github_remote_for(project_path: Path) -> str | None:
     return f"{match['owner']}/{match['repo']}"
 
 
+def read_branch(project_path: Path) -> str | None:
+    """Read the current branch name from .git/HEAD. Detached HEAD → short SHA."""
+    try:
+        head = (project_path / ".git" / "HEAD").read_text().strip()
+    except OSError:
+        return None
+    if head.startswith("ref: refs/heads/"):
+        return head[len("ref: refs/heads/"):]
+    return head[:7] if head else None
+
+
 def scan_local_projects() -> list[dict]:
     projects = []
     for entry in sorted(PROJECTS_DIR.iterdir(), key=lambda p: p.name.lower()):
@@ -130,6 +141,7 @@ def scan_local_projects() -> list[dict]:
             "name": entry.name,
             "path": entry,
             "github": github_remote_for(entry),
+            "branch": read_branch(entry),
         })
     return projects
 
@@ -194,10 +206,6 @@ class Banner(Vertical):
     def on_resize(self) -> None:
         """Re-center on terminal resize."""
         self.apply_theme()
-        self._reapply_stats()
-
-    def _reapply_stats(self) -> None:
-        """Re-render the cached stats line at current width. No-op if uncached."""
         if self._last_stats is not None:
             self.show_stats(*self._last_stats)
 
@@ -207,7 +215,6 @@ class Banner(Vertical):
         view_label = "  Local" if view == "local" else "  GitHub"
         view_color = colors.view_local if view == "local" else colors.view_github
 
-        # Build the visible string first to compute centering pad.
         visible = (
             f"your project switchboard    {view_label}  ·  "
             f"{local} projects  ·  {github} on github  ·  {synced} synced"
@@ -230,6 +237,20 @@ class Banner(Vertical):
         self.query_one("#banner-stats", Static).update(stats)
 
 
+class DetailPanel(Static):
+    """Right-side panel showing details of the focused project."""
+
+    DEFAULT_CSS = """
+    DetailPanel {
+        width: 1fr;
+        height: 1fr;
+        padding: 1 3;
+        background: transparent;
+        border-left: vkey $surface;
+    }
+    """
+
+
 class ProjectsApp(App):
     TITLE = "opus-tui"
 
@@ -239,12 +260,27 @@ class ProjectsApp(App):
     Screen {
         background: $background;
     }
-    DataTable {
+    #main {
         height: 1fr;
-        border: blank;
+    }
+    OptionList {
+        width: 1fr;
+        height: 1fr;
         background: transparent;
-        margin: 1 3 0 3;
+        border: blank;
+        padding: 0 2;
         scrollbar-size-vertical: 1;
+    }
+    OptionList:focus {
+        border: blank;
+    }
+    OptionList > .option-list--option-highlighted {
+        background: $primary 20%;
+        text-style: bold;
+    }
+    OptionList:focus > .option-list--option-highlighted {
+        background: $primary 35%;
+        text-style: bold;
     }
     Footer {
         background: $surface;
@@ -264,27 +300,24 @@ class ProjectsApp(App):
         super().__init__()
         self.local_projects: list[dict] = []
         self.github_repos: list[dict] = []
-        # Default colors so widgets mounting before _reload_theme have something
-        # to read. _reload_theme overwrites in on_mount.
         self._app_colors: AppColors = palette_to_app_colors(FALLBACK_PALETTE)
         self._omarchy_mtime: float | None = None
+        self._github_set: set[str] = set()
+        self._local_set: set[str] = set()
+        self._last_highlighted: int | None = None
 
     def compose(self) -> ComposeResult:
         yield Banner()
-        yield DataTable(
-            id="projects",
-            cursor_type="row",
-            zebra_stripes=True,
-            show_header=False,
-        )
+        with Horizontal(id="main"):
+            yield OptionList(id="projects")
+            yield DetailPanel(id="detail")
         yield Footer()
 
     def on_mount(self) -> None:
         self._reload_theme()
-        self._setup_columns_for_view("local")
-        table = self.query_one("#projects", DataTable)
-        table.loading = True
-        table.focus()
+        plist = self.query_one(OptionList)
+        plist.loading = True
+        plist.focus()
         self.set_interval(2.0, self._poll_theme)
         self.load_data()
 
@@ -323,29 +356,9 @@ class ProjectsApp(App):
             pass  # Banner may not be mounted on first call from on_mount
 
         if self.local_projects or self.github_repos:
-            self._render_view()
+            self._populate_list()
 
-    # ── cell rendering ─────────────────────────────────────────────────────
-
-    def _name_cell(self, name: str) -> Text:
-        return Text(name, style=f"bold {self._app_colors.text}")
-
-    def _remote_cell(self, remote: str | None) -> Text:
-        if remote is None:
-            return Text("—", style=f"dim {self._app_colors.dim}")
-        return Text(remote, style=self._app_colors.subtle)
-
-    def _lang_cell(self, lang: str) -> Text:
-        if lang == "-":
-            return Text("—", style=f"dim {self._app_colors.dim}")
-        color = LANGUAGE_COLORS.get(lang, self._app_colors.lang_fallback)
-        return Text(f"● {lang}", style=f"bold {color}")
-
-    def _vis_cell(self, visibility: str) -> Text:
-        c = self._app_colors
-        if visibility.lower() == "public":
-            return Text(" PUBLIC ", style=f"bold {c.badge_text} on {c.badge_public_bg}")
-        return Text(" PRIVATE ", style=f"bold {c.badge_text} on {c.badge_private_bg}")
+    # ── cell rendering helpers (used by list rows + detail panel) ──────────
 
     def _local_sync_cell(self, synced: bool) -> Text:
         if synced:
@@ -357,20 +370,222 @@ class ProjectsApp(App):
             return Text("●", style=f"bold {self._app_colors.glyph_synced}")
         return Text("☁", style=f"bold {self._app_colors.glyph_github_only}")
 
-    # ── data load + render ─────────────────────────────────────────────────
+    def _vis_cell(self, visibility: str) -> Text:
+        c = self._app_colors
+        if visibility.lower() == "public":
+            return Text(" PUBLIC ", style=f"bold {c.badge_text} on {c.badge_public_bg}")
+        return Text(" PRIVATE ", style=f"bold {c.badge_text} on {c.badge_private_bg}")
 
-    def _setup_columns_for_view(self, view: str) -> None:
-        table = self.query_one("#projects", DataTable)
-        table.clear(columns=True)
+    def _lang_cell(self, lang: str) -> Text:
+        if lang == "-":
+            return Text("—", style=f"dim {self._app_colors.dim}")
+        color = LANGUAGE_COLORS.get(lang, self._app_colors.lang_fallback)
+        return Text(f"● {lang}", style=f"bold {color}")
+
+    # ── list rendering ─────────────────────────────────────────────────────
+
+    def _list_content_width(self) -> int:
+        """Width of the OptionList's content area (after CSS padding 0 2)."""
+        try:
+            plist = self.query_one(OptionList)
+            return max(0, (plist.size.width or 0) - 4)
+        except Exception:
+            return 40
+
+    def _list_row(self, item: dict, view: str, focused: bool) -> Text:
         if view == "local":
-            table.add_column(" ", key="sync", width=2)
-            table.add_column("Name", key="name")
-            table.add_column("Remote", key="remote")
+            synced = item.get("github") in self._github_set
+            glyph = self._local_sync_cell(synced)
         else:
-            table.add_column(" ", key="sync", width=2)
-            table.add_column("Name", key="name")
-            table.add_column("Visibility", key="vis", width=11)
-            table.add_column("Language", key="lang")
+            synced = item["nameWithOwner"] in self._local_set
+            glyph = self._github_sync_cell(synced)
+
+        arrow_color = (
+            self._app_colors.view_local
+            if view == "local"
+            else self._app_colors.view_github
+        )
+        arrow = Text("▸ " if focused else "  ", style=f"bold {arrow_color}")
+        content = Text.assemble(
+            arrow,
+            glyph,
+            "  ",
+            Text(item["name"], style=f"bold {self._app_colors.text}"),
+        )
+
+        # Right-align: pad the start so content drifts toward the central divider.
+        pad = max(0, self._list_content_width() - content.cell_len - 1)
+        return Text.assemble(Text(" " * pad), content)
+
+    def _populate_list(self) -> None:
+        self._github_set = {r["nameWithOwner"] for r in self.github_repos}
+        self._local_set = {p["github"] for p in self.local_projects if p["github"]}
+        synced_count = sum(
+            1 for p in self.local_projects if p.get("github") in self._github_set
+        )
+
+        self.query_one(Banner).show_stats(
+            self.view,
+            len(self.local_projects),
+            len(self.github_repos),
+            synced_count,
+        )
+
+        items = self.local_projects if self.view == "local" else self.github_repos
+        plist = self.query_one(OptionList)
+        plist.clear_options()
+        self._last_highlighted = None
+
+        if not items:
+            self._show_empty_detail()
+            return
+
+        for item in items:
+            plist.add_option(self._list_row(item, self.view, focused=False))
+
+        # Explicit first-row selection. OptionList auto-highlights index 0 on
+        # first add and fires OptionHighlighted, but timing is racy with the
+        # post-load layout pass — better to set state ourselves and let the
+        # deferred refresh below do the actual prompt re-render at the
+        # now-known content width.
+        self._last_highlighted = 0
+        plist.highlighted = 0  # Textual's selection state (Enter will trigger OptionSelected)
+        plist.focus()          # loading-state transition can drop focus; re-assert
+        self._update_detail_for_index(0)
+        self.call_after_refresh(self._refresh_list_rows)
+
+    def _refresh_list_rows(self) -> None:
+        """Re-render every list row at current OptionList width."""
+        items = self.local_projects if self.view == "local" else self.github_repos
+        if not items:
+            return
+        try:
+            plist = self.query_one(OptionList)
+        except Exception:
+            return
+        for idx, item in enumerate(items):
+            focused = idx == self._last_highlighted
+            try:
+                plist.replace_option_prompt_at_index(
+                    idx, self._list_row(item, self.view, focused)
+                )
+            except Exception:
+                pass
+
+    @on(OptionList.OptionHighlighted)
+    def _on_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        plist = event.option_list
+        idx = event.option_index
+
+        # Remove arrow from previously focused row.
+        if self._last_highlighted is not None and self._last_highlighted != idx:
+            try:
+                items = (
+                    self.local_projects
+                    if self.view == "local"
+                    else self.github_repos
+                )
+                old_item = items[self._last_highlighted]
+                plist.replace_option_prompt_at_index(
+                    self._last_highlighted,
+                    self._list_row(old_item, self.view, focused=False),
+                )
+            except IndexError:
+                pass
+
+        # Apply arrow to newly focused row.
+        items = self.local_projects if self.view == "local" else self.github_repos
+        try:
+            new_item = items[idx]
+            plist.replace_option_prompt_at_index(
+                idx, self._list_row(new_item, self.view, focused=True)
+            )
+        except IndexError:
+            pass
+
+        self._last_highlighted = idx
+        self._update_detail_for_index(idx)
+
+    # ── detail panel ───────────────────────────────────────────────────────
+
+    def _update_detail_for_index(self, idx: int) -> None:
+        items = self.local_projects if self.view == "local" else self.github_repos
+        if not (0 <= idx < len(items)):
+            self._show_empty_detail()
+            return
+        if self.view == "local":
+            self._show_local_detail(items[idx])
+        else:
+            self._show_github_detail(items[idx])
+
+    def _show_empty_detail(self) -> None:
+        c = self._app_colors
+        self.query_one(DetailPanel).update(
+            Text("(no projects)", style=f"dim {c.dim}")
+        )
+
+    def _show_local_detail(self, project: dict) -> None:
+        c = self._app_colors
+        path = str(project["path"])
+        home = str(Path.home())
+        if path.startswith(home):
+            path = "~" + path[len(home):]
+
+        github = project.get("github") or "—"
+        branch = project.get("branch") or "?"
+        synced = project.get("github") in self._github_set
+
+        body = Text()
+        body.append(project["name"], style=f"bold {c.text}")
+        body.append("\n")
+        body.append(path, style=f"italic {c.subtle}")
+        body.append("\n\n")
+        body.append_text(self._kv("github", Text(github, style=c.subtle)))
+        body.append("\n")
+        body.append_text(self._kv("branch", Text(branch, style=c.subtle)))
+        body.append("\n")
+        body.append_text(
+            self._kv(
+                "status",
+                Text("synced", style=f"bold {c.glyph_synced}")
+                if synced
+                else Text("local-only", style=c.muted_rule),
+            )
+        )
+        self.query_one(DetailPanel).update(body)
+
+    def _show_github_detail(self, repo: dict) -> None:
+        c = self._app_colors
+        synced = repo["nameWithOwner"] in self._local_set
+        lang = (repo.get("primaryLanguage") or {}).get("name") or "-"
+
+        body = Text()
+        body.append(repo["name"], style=f"bold {c.text}")
+        body.append("\n")
+        body.append(repo["nameWithOwner"], style=f"italic {c.subtle}")
+        body.append("\n\n")
+        body.append_text(self._kv("visibility", self._vis_cell(repo["visibility"])))
+        body.append("\n")
+        body.append_text(self._kv("language", self._lang_cell(lang)))
+        body.append("\n")
+        body.append_text(
+            self._kv(
+                "status",
+                Text("cloned locally", style=f"bold {c.glyph_synced}")
+                if synced
+                else Text("not cloned", style=f"bold {c.glyph_github_only}"),
+            )
+        )
+        self.query_one(DetailPanel).update(body)
+
+    def _kv(self, key: str, value: Text) -> Text:
+        c = self._app_colors
+        return Text.assemble(
+            (f"  {key:>10}  ", f"{c.dim}"),
+            value,
+        )
+
+    # ── data load ──────────────────────────────────────────────────────────
 
     @work(thread=True)
     def load_data(self) -> None:
@@ -383,57 +598,27 @@ class ProjectsApp(App):
     ) -> None:
         self.local_projects = local_projects
         self.github_repos = github_repos
-        self._render_view()
-        self.query_one("#projects", DataTable).loading = False
+        self._populate_list()
+        self.query_one(OptionList).loading = False
 
-    def _render_view(self) -> None:
-        github_owner_names = {r["nameWithOwner"] for r in self.github_repos}
-        local_owner_names = {p["github"] for p in self.local_projects if p["github"]}
-        synced_count = sum(
-            1 for p in self.local_projects if p["github"] in github_owner_names
-        )
-
-        self.query_one(Banner).show_stats(
-            self.view,
-            len(self.local_projects),
-            len(self.github_repos),
-            synced_count,
-        )
-
-        self._setup_columns_for_view(self.view)
-        table = self.query_one("#projects", DataTable)
-
-        if self.view == "local":
-            for proj in self.local_projects:
-                synced = proj["github"] in github_owner_names
-                table.add_row(
-                    self._local_sync_cell(synced),
-                    self._name_cell(proj["name"]),
-                    self._remote_cell(proj["github"]),
-                )
-        else:
-            for repo in self.github_repos:
-                synced = repo["nameWithOwner"] in local_owner_names
-                lang = (repo.get("primaryLanguage") or {}).get("name") or "-"
-                table.add_row(
-                    self._github_sync_cell(synced),
-                    self._name_cell(repo["name"]),
-                    self._vis_cell(repo["visibility"]),
-                    self._lang_cell(lang),
-                )
+    # ── reactive watchers + actions ────────────────────────────────────────
 
     def watch_view(self, _old: str, _new: str) -> None:
         if self.local_projects or self.github_repos:
-            self._render_view()
+            self._populate_list()
 
     def action_toggle_view(self) -> None:
         self.view = "github" if self.view == "local" else "local"
 
     def action_refresh(self) -> None:
-        table = self.query_one("#projects", DataTable)
-        table.clear()
-        table.loading = True
+        plist = self.query_one(OptionList)
+        plist.clear_options()
+        plist.loading = True
         self.load_data()
+
+    def on_resize(self) -> None:
+        """Re-render right-padded list rows when the layout reflows."""
+        self._refresh_list_rows()
 
 
 def main() -> None:
