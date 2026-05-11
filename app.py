@@ -93,6 +93,7 @@ class ProjectsApp(App):
         Binding("c", "clone", "Clone"),
         Binding("n", "new_project", "New"),
         Binding("d", "delete_project", "Delete"),
+        Binding("o", "open_project", "Open"),
         Binding("r", "refresh", "Refresh"),
     ]
 
@@ -996,6 +997,56 @@ class ProjectsApp(App):
 
         if do_github_refetch:
             self._refetch_github()
+
+    # ── open project ───────────────────────────────────────────────────────
+
+    @on(OptionList.OptionSelected)
+    def _on_option_selected(self, _event: OptionList.OptionSelected) -> None:
+        # Enter on a row → same as pressing `o`. The OptionList captures Enter
+        # and fires OptionSelected; we route both inputs through the same action.
+        self.action_open_project()
+
+    def action_open_project(self) -> None:
+        if self.view != "local":
+            self.notify(
+                "Switch to local view (g) to open a project",
+                severity="information",
+            )
+            return
+        if self._last_highlighted is None or not self.local_projects:
+            return
+        idx = self._last_highlighted
+        if not (0 <= idx < len(self.local_projects)):
+            return
+        project = self.local_projects[idx]
+        name = project["name"]
+        path = project["path"]
+        if not path.is_dir():
+            self.notify(
+                f"{path} no longer exists — try refresh (r)",
+                severity="warning",
+            )
+            return
+
+        logger.info("open_project: name=%s path=%s", name, path)
+        try:
+            # Popen + start_new_session: detach from opus-tui's process group
+            # so the editor survives our exit() below.
+            subprocess.Popen(
+                ["omarchy-launch-editor", str(path)],
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            logger.error("open_project: omarchy-launch-editor not on PATH")
+            self.notify(
+                "omarchy-launch-editor not found on PATH",
+                severity="error",
+                timeout=8,
+            )
+            return
+
+        # Switchboard metaphor: connect the call, get out of the way.
+        self.exit()
 
     # ── clone spinner ──────────────────────────────────────────────────────
 

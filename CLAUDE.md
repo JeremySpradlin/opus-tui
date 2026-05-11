@@ -66,6 +66,6 @@ Reads `~/.config/omarchy/current/theme.name` and `~/.config/omarchy/current/them
 
 ## Keybindings
 
-Defined on `ProjectsApp.BINDINGS`: `q` quit, `g` toggle local↔github view, `c` clone (github view only; smart-jumps to local if already cloned), `n` new project (modal), `d` delete project (local view only; modal offers local-only or local+github), `r` refresh.
+Defined on `ProjectsApp.BINDINGS`: `q` quit, `g` toggle local↔github view, `c` clone (github view only; smart-jumps to local if already cloned), `n` new project (modal), `d` delete project (local view only; modal offers local-only or local+github), `o` open project in `$EDITOR` via `omarchy-launch-editor` (local view only; opus-tui exits after launching), `r` refresh. Enter is also wired to `o` via `OptionList.OptionSelected`.
 
 Delete-from-GitHub requires the `delete_repo` OAuth scope on `gh`. The TUI does a quick `gh auth status` check (`_has_delete_scope`) before invoking `gh repo delete` and refuses with a notification pointing at `gh auth refresh -h github.com -s delete_repo` if missing — local rmtree is *not* attempted in that path, so the user doesn't lose local files just because the github side is misconfigured.
