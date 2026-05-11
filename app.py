@@ -8,6 +8,7 @@ lives in widgets.py; this module is the glue.
 import logging
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from rich.text import Text
@@ -776,13 +777,63 @@ class ProjectsApp(App):
             r.returncode, r.stdout.strip()[:300], r.stderr.strip()[:300],
         )
         if r.returncode != 0:
-            self.call_from_thread(
-                self.notify,
-                f"GitHub create failed (local repo intact): "
-                f"{r.stderr.strip()[:120]}",
-                severity="warning",
-                timeout=8,
+            # Detect github replication race: gh creates the repo via the API
+            # but the immediate `git push` runs before github's git endpoint
+            # is ready, failing with "Repository not found" / fatal: repo not
+            # found. The repo URL appears in stdout iff the API call succeeded;
+            # the stderr signals the push race. When we see this pattern,
+            # retry the push (the repo already exists, no need to recreate).
+            repo_created = "github.com/" in r.stdout
+            push_race = (
+                repo_created
+                and "Repository not found" in r.stderr
+                and "fatal: repository" in r.stderr
             )
+            if push_race:
+                logger.warning(
+                    "create_project: gh push race detected, retrying push"
+                )
+                push_ok = False
+                for delay in (0.5, 1.0, 2.0):
+                    time.sleep(delay)
+                    push_cmd = [
+                        "git", "-C", str(target),
+                        "push", "-u", "origin", "main",
+                    ]
+                    logger.debug("retry push: $ %s", " ".join(push_cmd))
+                    pr = subprocess.run(
+                        push_cmd, capture_output=True, text=True,
+                    )
+                    logger.info(
+                        "retry push: rc=%d stderr=%r",
+                        pr.returncode, pr.stderr.strip()[:200],
+                    )
+                    if pr.returncode == 0:
+                        push_ok = True
+                        break
+                if push_ok:
+                    self.call_from_thread(
+                        self.notify,
+                        f"Created {name} (recovered from push race)",
+                        severity="information",
+                        timeout=4,
+                    )
+                else:
+                    self.call_from_thread(
+                        self.notify,
+                        f"Created {name} on GitHub, but push failed. "
+                        f"Run: git push -u origin main from the project dir",
+                        severity="warning",
+                        timeout=10,
+                    )
+            else:
+                self.call_from_thread(
+                    self.notify,
+                    f"GitHub create failed (local repo intact): "
+                    f"{r.stderr.strip()[:120]}",
+                    severity="warning",
+                    timeout=8,
+                )
         else:
             self.call_from_thread(
                 self.notify,
