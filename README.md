@@ -1,6 +1,17 @@
 # opus-tui
 A TUI application for Omarchy for quickly adding and managing projects
 
+## Prerequisites
+
+- `gh` CLI installed and authenticated (`gh auth login`).
+- For the (planned) "delete from GitHub" feature, the default `gh` auth
+  doesn't include the `delete_repo` scope. Grant it once with:
+
+      gh auth refresh -h github.com -s delete_repo
+
+  This is a browser-based OAuth flow, one-time per machine. The TUI will
+  detect the missing scope and remind you if you skip this.
+
 ## Omarchy / Hyprland setup (Super+P)
 
 opus-tui follows Omarchy's centered-floating-window convention (same style as

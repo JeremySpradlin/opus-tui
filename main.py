@@ -467,6 +467,109 @@ class NewProjectModal(ModalScreen[dict | None]):
         })
 
 
+class DeleteProjectModal(ModalScreen[dict | None]):
+    """Confirm dialog for deleting a project (local-only or local + GitHub)."""
+
+    DEFAULT_CSS = """
+    DeleteProjectModal {
+        align: center middle;
+    }
+    DeleteProjectModal > Vertical {
+        width: 64;
+        height: auto;
+        padding: 1 2;
+        background: $background;
+        border: heavy $error;
+        border-title-align: left;
+        border-title-color: $error;
+        border-title-style: bold;
+    }
+    DeleteProjectModal Label {
+        margin-top: 1;
+        color: $foreground;
+    }
+    DeleteProjectModal Label.first {
+        margin-top: 0;
+    }
+    DeleteProjectModal Label.path {
+        color: $text-muted;
+        margin-top: 0;
+    }
+    DeleteProjectModal Label.warning {
+        color: $warning;
+        margin-top: 1;
+    }
+    DeleteProjectModal RadioSet {
+        margin: 0;
+        padding: 0 1;
+        height: auto;
+        background: transparent;
+        border: blank;
+    }
+    DeleteProjectModal Horizontal#actions {
+        align: right middle;
+        height: 3;
+        margin-top: 1;
+    }
+    DeleteProjectModal Button {
+        margin-left: 2;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, name: str, path: Path, owner_name: str | None) -> None:
+        super().__init__()
+        self._name = name
+        self._path = path
+        self._owner_name = owner_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self._name, classes="first")
+            yield Label(str(self._path).replace(str(Path.home()), "~", 1),
+                        classes="path")
+            if self._owner_name:
+                yield Label(self._owner_name, classes="path")
+                yield Label("Scope")
+                with RadioSet(id="scope"):
+                    yield RadioButton("Local only", value=True, id="local-only")
+                    yield RadioButton("Local + GitHub", id="local-github")
+            yield Label("This cannot be undone.", classes="warning")
+            with Horizontal(id="actions"):
+                yield Button("Cancel", id="cancel")
+                yield Button("Delete", variant="error", id="submit")
+
+    def on_mount(self) -> None:
+        self.query_one("#dialog", Vertical).border_title = " Delete project "
+        # Focus the scope radio (or Cancel if there's no scope choice). Either
+        # way, Enter on the focused widget is a no-op — neither RadioSet nor
+        # Cancel triggers delete — so we keep the "Enter won't delete" safety
+        # while removing a tab for the user who actually wants to change scope.
+        if self._owner_name:
+            self.query_one("#scope", RadioSet).focus()
+        else:
+            self.query_one("#cancel", Button).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#cancel")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#submit")
+    def _on_submit(self) -> None:
+        include_github = False
+        if self._owner_name:
+            radioset = self.query_one("#scope", RadioSet)
+            pressed = radioset.pressed_button
+            include_github = pressed is not None and pressed.id == "local-github"
+        self.dismiss({"include_github": include_github})
+
+
 class ProjectsApp(App):
     TITLE = "opus-tui"
 
@@ -509,6 +612,7 @@ class ProjectsApp(App):
         Binding("g", "toggle_view", "Switch view"),
         Binding("c", "clone", "Clone"),
         Binding("n", "new_project", "New"),
+        Binding("d", "delete_project", "Delete"),
         Binding("r", "refresh", "Refresh"),
     ]
 
@@ -1265,6 +1369,158 @@ class ProjectsApp(App):
 
         # Either way, refresh local list and jump to the new project.
         self.call_from_thread(self._refresh_after_clone, str(target))
+
+    # ── delete project ─────────────────────────────────────────────────────
+
+    def action_delete_project(self) -> None:
+        if self.view != "local":
+            self.notify(
+                "Switch to local view (g) to delete a project",
+                severity="information",
+            )
+            return
+        if self._cloning_repo_index is not None or self._creating_name is not None:
+            self.notify(
+                "Wait for the current operation to finish",
+                severity="warning",
+            )
+            return
+        if self._last_highlighted is None or not self.local_projects:
+            return
+        idx = self._last_highlighted
+        if not (0 <= idx < len(self.local_projects)):
+            return
+        project = self.local_projects[idx]
+        name = project["name"]
+        path = project["path"]
+        owner_name = project.get("github")
+
+        def handle_result(result: dict | None) -> None:
+            if result is None:
+                return
+            include_github = result["include_github"]
+            if include_github and not self._has_delete_scope():
+                self.notify(
+                    "Need delete_repo scope. Run:\n"
+                    "gh auth refresh -h github.com -s delete_repo",
+                    severity="warning",
+                    timeout=10,
+                )
+                return
+            self.notify(f"Deleting {name}…", severity="information", timeout=2)
+            self._delete_project(name, path, owner_name, include_github)
+
+        self.push_screen(
+            DeleteProjectModal(name, path, owner_name),
+            handle_result,
+        )
+
+    def _has_delete_scope(self) -> bool:
+        """Quick check: does gh auth include the delete_repo scope?"""
+        try:
+            r = subprocess.run(
+                ["gh", "auth", "status"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.warning("delete_scope check failed: %s", e)
+            return False
+        # gh auth status prints the granted scopes on a "Token scopes:" line
+        return "delete_repo" in (r.stdout + r.stderr)
+
+    @work(thread=True)
+    def _delete_project(
+        self, name: str, path: Path, owner_name: str | None, include_github: bool,
+    ) -> None:
+        logger.info(
+            "delete_project start: name=%s path=%s github=%s include_github=%s",
+            name, path, owner_name, include_github,
+        )
+
+        # Local rmtree
+        try:
+            shutil.rmtree(path)
+            logger.info("local rmtree ok: %s", path)
+        except OSError as e:
+            logger.error("rmtree failed: %s", e)
+            self.call_from_thread(
+                self.notify,
+                f"Couldn't delete {path}: {e}",
+                severity="error",
+                timeout=6,
+            )
+            return
+
+        # Optional GitHub delete
+        github_succeeded = False
+        if include_github and owner_name:
+            cmd = ["gh", "repo", "delete", owner_name, "--yes"]
+            logger.debug("$ %s", " ".join(cmd))
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            logger.info(
+                "gh repo delete: rc=%d stderr=%r",
+                r.returncode, r.stderr.strip()[:300],
+            )
+            if r.returncode != 0:
+                stderr = r.stderr.strip()
+                hint = ""
+                if "delete_repo" in stderr.lower() or "scope" in stderr.lower():
+                    hint = " (need delete_repo scope; see README)"
+                self.call_from_thread(
+                    self.notify,
+                    f"Local deleted; GitHub remove failed{hint}: {stderr[:120]}",
+                    severity="warning",
+                    timeout=8,
+                )
+            else:
+                github_succeeded = True
+                self.call_from_thread(
+                    self.notify,
+                    f"Deleted {name} (local + GitHub)",
+                    severity="information",
+                    timeout=3,
+                )
+        else:
+            self.call_from_thread(
+                self.notify,
+                f"Deleted {name} (local)",
+                severity="information",
+                timeout=3,
+            )
+
+        # Refresh local; refetch github only if we actually changed github state.
+        local_projects = scan_local_projects()
+        self.call_from_thread(
+            self._post_delete_local_loaded,
+            local_projects,
+            github_succeeded,
+        )
+
+    def _post_delete_local_loaded(
+        self, local_projects: list[dict], do_github_refetch: bool,
+    ) -> None:
+        prev_idx = self._last_highlighted
+        self.local_projects = local_projects
+        # We only delete from local view, so this populate is always for local.
+        # _populate_list will reset cursor to 0 — clamp to prev_idx after refresh.
+        self._populate_list()
+
+        def _restore_cursor() -> None:
+            try:
+                plist = self.query_one(OptionList)
+                if plist.option_count == 0:
+                    return
+                target = min(
+                    prev_idx if prev_idx is not None else 0,
+                    plist.option_count - 1,
+                )
+                plist.highlighted = target
+            except Exception:
+                pass
+        self.call_after_refresh(_restore_cursor)
+
+        if do_github_refetch:
+            self._refetch_github()
 
     # ── clone spinner ──────────────────────────────────────────────────────
 
