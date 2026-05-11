@@ -14,11 +14,14 @@ current banner's visual identity when Omarchy isn't available.
 """
 
 import colorsys
+import logging
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
 from textual.theme import Theme
+
+logger = logging.getLogger(__name__)
 
 OMARCHY_DIR = Path.home() / ".config" / "omarchy" / "current"
 THEME_NAME_FILE = OMARCHY_DIR / "theme.name"
@@ -103,13 +106,16 @@ def read_omarchy() -> tuple[str, OmarchyPalette] | None:
     """Parse Omarchy's active theme. Returns None on any failure."""
     try:
         if not THEME_NAME_FILE.is_file() or not COLORS_TOML_FILE.is_file():
+            logger.debug("omarchy theme files not present")
             return None
         name = THEME_NAME_FILE.read_text().strip()
         if not name:
+            logger.warning("omarchy theme.name is empty")
             return None
         with COLORS_TOML_FILE.open("rb") as f:
             data = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError):
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        logger.warning("read_omarchy: parse error: %s", e)
         return None
 
     required = (
@@ -122,9 +128,11 @@ def read_omarchy() -> tuple[str, OmarchyPalette] | None:
     )
     for key in required:
         if not _hex_ok(data.get(key)):
+            logger.warning("omarchy colors.toml missing/bad key: %s", key)
             return None
     for i in range(16):
         if not _hex_ok(data.get(f"color{i}")):
+            logger.warning("omarchy colors.toml missing/bad color%d", i)
             return None
 
     palette = OmarchyPalette(
@@ -136,6 +144,7 @@ def read_omarchy() -> tuple[str, OmarchyPalette] | None:
         selection_background=data["selection_background"],
         colors=tuple(data[f"color{i}"] for i in range(16)),
     )
+    logger.debug("read_omarchy: name=%s accent=%s", name, palette.accent)
     return name, palette
 
 

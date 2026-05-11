@@ -10,10 +10,12 @@ re-applies live within ~2 seconds when the user runs `omarchy theme set`.
 """
 
 import json
+import logging
 import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from rich.text import Text
@@ -35,6 +37,44 @@ from theme import (
 )
 
 PROJECTS_DIR = Path.home() / "Projects"
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_KEEP = 20  # keep this many most-recent log files
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging() -> Path:
+    """Configure file-only logging at DEBUG level.
+
+    One log file per app session, named opus-tui-YYYYMMDD-HHMMSS.log under
+    ./logs/. Keeps only the most recent LOG_KEEP files. Returns the path of
+    the freshly opened log file.
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOG_DIR / f"opus-tui-{datetime.now():%Y%m%d-%H%M%S}.log"
+    logging.basicConfig(
+        filename=str(log_file),
+        filemode="w",
+        level=logging.DEBUG,
+        format="%(asctime)s.%(msecs)03d %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    # Quiet down noisy third-party loggers
+    logging.getLogger("markdown_it").setLevel(logging.WARNING)
+    _prune_old_logs()
+    return log_file
+
+
+def _prune_old_logs(keep: int = LOG_KEEP) -> None:
+    try:
+        existing = sorted(LOG_DIR.glob("opus-tui-*.log"), reverse=True)
+        for old in existing[keep:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 REPO_FIELDS = [
     "name",
@@ -95,6 +135,7 @@ def preflight() -> None:
 
 
 def fetch_github_repos(limit: int = 1000) -> list[dict]:
+    logger.debug("fetch_github_repos: limit=%d", limit)
     result = subprocess.run(
         [
             "gh", "repo", "list",
@@ -105,7 +146,9 @@ def fetch_github_repos(limit: int = 1000) -> list[dict]:
         text=True,
         check=True,
     )
-    return json.loads(result.stdout)
+    repos = json.loads(result.stdout)
+    logger.info("fetch_github_repos: %d repos returned", len(repos))
+    return repos
 
 
 def github_remote_for(project_path: Path) -> str | None:
@@ -177,6 +220,8 @@ def scan_local_projects() -> list[dict]:
             "github": github_remote_for(entry),
             "branch": read_branch(entry),
         })
+    logger.info("scan_local_projects: %d git-initialized dirs in %s",
+                len(projects), PROJECTS_DIR)
     return projects
 
 
@@ -354,6 +399,7 @@ class ProjectsApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        logger.info("ProjectsApp.on_mount")
         self._reload_theme()
         plist = self.query_one(OptionList)
         plist.loading = True
@@ -374,6 +420,7 @@ class ProjectsApp(App):
     def _reload_theme(self) -> None:
         result = read_omarchy()
         name, palette = result if result else (FALLBACK_NAME, FALLBACK_PALETTE)
+        logger.info("reload_theme: name=%s (omarchy=%s)", name, result is not None)
 
         try:
             self._omarchy_mtime = THEME_NAME_FILE.stat().st_mtime
@@ -747,9 +794,12 @@ class ProjectsApp(App):
             self._populate_list()
 
     def action_toggle_view(self) -> None:
-        self.view = "github" if self.view == "local" else "local"
+        new_view = "github" if self.view == "local" else "local"
+        logger.info("toggle view: %s → %s", self.view, new_view)
+        self.view = new_view
 
     def action_refresh(self) -> None:
+        logger.info("refresh requested")
         plist = self.query_one(OptionList)
         plist.clear_options()
         plist.loading = True
@@ -803,10 +853,18 @@ class ProjectsApp(App):
 
     @work(thread=True)
     def clone_repo(self, owner_name: str, target: str, idx: int) -> None:
-        result = subprocess.run(
-            ["gh", "repo", "clone", owner_name, target],
-            capture_output=True, text=True,
+        cmd = ["gh", "repo", "clone", owner_name, target]
+        logger.info("clone start: %s → %s", owner_name, target)
+        logger.debug("$ %s", " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        logger.info(
+            "clone done: rc=%d owner_name=%s",
+            result.returncode, owner_name,
         )
+        if result.returncode != 0:
+            logger.warning(
+                "clone stderr: %s", (result.stderr or "").strip()[:300]
+            )
         self.call_from_thread(
             self._on_clone_done,
             owner_name,
@@ -928,8 +986,17 @@ class ProjectsApp(App):
 
 
 def main() -> None:
-    preflight()
-    ProjectsApp().run()
+    log_file = setup_logging()
+    logger.info("opus-tui starting; log_file=%s", log_file)
+    try:
+        preflight()
+        ProjectsApp().run()
+    except Exception:
+        logger.exception("Fatal error in main")
+        raise
+    finally:
+        logger.info("opus-tui exiting")
+        logging.shutdown()
 
 
 if __name__ == "__main__":
