@@ -24,7 +24,18 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
-from textual.widgets import Footer, OptionList, Rule, Static
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button,
+    Footer,
+    Input,
+    Label,
+    OptionList,
+    RadioButton,
+    RadioSet,
+    Rule,
+    Static,
+)
 
 from theme import (
     AppColors,
@@ -294,9 +305,18 @@ class Banner(Vertical):
         view_label = "  Local" if view == "local" else "  GitHub"
         view_color = colors.view_local if view == "local" else colors.view_github
 
+        creating: str | None = getattr(self.app, "_creating_name", None)
+        creating_suffix = ""
+        if creating:
+            spinner = SPINNER_FRAMES[
+                getattr(self.app, "_spinner_frame", 0) % len(SPINNER_FRAMES)
+            ]
+            creating_suffix = f"    {spinner} creating {creating}…"
+
         visible = (
             f"your project switchboard    {view_label}  ·  "
             f"{local} projects  ·  {github} on github  ·  {synced} linked"
+            f"{creating_suffix}"
         )
         pad = " " * max(0, (self._content_width() - len(visible)) // 2)
 
@@ -313,6 +333,12 @@ class Banner(Vertical):
             (str(synced), f"bold {colors.glyph_synced}"),
             (" linked", colors.muted_rule),
         )
+        if creating:
+            spinner = SPINNER_FRAMES[
+                getattr(self.app, "_spinner_frame", 0) % len(SPINNER_FRAMES)
+            ]
+            stats.append(f"    {spinner} ", style=f"bold {colors.view_local}")
+            stats.append(f"creating {creating}…", style=f"italic {colors.subtle}")
         self.query_one("#banner-stats", Static).update(stats)
 
 
@@ -328,6 +354,117 @@ class DetailPanel(Static):
         border-left: vkey $surface;
     }
     """
+
+
+class NewProjectModal(ModalScreen[dict | None]):
+    """Modal form for creating a new project (~/Projects + GitHub repo)."""
+
+    DEFAULT_CSS = """
+    NewProjectModal {
+        align: center middle;
+    }
+    NewProjectModal > Vertical {
+        width: 64;
+        height: auto;
+        padding: 1 2;
+        background: $background;
+        border: heavy $primary;
+        border-title-align: left;
+        border-title-color: $primary;
+        border-title-style: bold;
+    }
+    NewProjectModal Label {
+        margin-top: 1;
+        color: $foreground;
+    }
+    NewProjectModal Label.first {
+        margin-top: 0;
+    }
+    NewProjectModal Input {
+        margin: 0;
+    }
+    NewProjectModal RadioSet {
+        margin: 0;
+        padding: 0 1;
+        height: auto;
+        background: transparent;
+        border: blank;
+    }
+    NewProjectModal Horizontal#actions {
+        align: right middle;
+        height: 3;
+        margin-top: 1;
+    }
+    NewProjectModal Button {
+        margin-left: 2;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("Name", classes="first")
+            yield Input(placeholder="my-new-project", id="name-input")
+            yield Label("Visibility")
+            with RadioSet(id="visibility"):
+                yield RadioButton("public")
+                yield RadioButton("private", value=True)
+            yield Label("Description (optional)")
+            yield Input(placeholder="What's this project for?", id="desc-input")
+            with Horizontal(id="actions"):
+                yield Button("Cancel", id="cancel")
+                yield Button("Create", variant="primary", id="submit")
+
+    def on_mount(self) -> None:
+        self.query_one("#dialog", Vertical).border_title = " New project "
+        self.query_one("#name-input", Input).focus()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#cancel")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#submit")
+    def _on_submit(self) -> None:
+        self._submit()
+
+    @on(Input.Submitted)
+    def _on_input_submit(self) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        name = self.query_one("#name-input", Input).value.strip()
+        if not name:
+            self.notify("Name is required", severity="warning")
+            self.query_one("#name-input", Input).focus()
+            return
+        if "/" in name or " " in name:
+            self.notify(
+                "Name can't contain slashes or spaces", severity="warning"
+            )
+            return
+        target = PROJECTS_DIR / name
+        if target.exists():
+            self.notify(
+                f"~/Projects/{name} already exists", severity="warning"
+            )
+            return
+
+        radioset = self.query_one("#visibility", RadioSet)
+        is_private = True
+        if radioset.pressed_button is not None:
+            is_private = "private" in str(radioset.pressed_button.label).lower()
+
+        self.dismiss({
+            "name": name,
+            "private": is_private,
+            "description": self.query_one("#desc-input", Input).value.strip(),
+        })
 
 
 class ProjectsApp(App):
@@ -371,6 +508,7 @@ class ProjectsApp(App):
         Binding("q", "quit", "Quit"),
         Binding("g", "toggle_view", "Switch view"),
         Binding("c", "clone", "Clone"),
+        Binding("n", "new_project", "New"),
         Binding("r", "refresh", "Refresh"),
     ]
 
@@ -388,6 +526,8 @@ class ProjectsApp(App):
         self._github_loaded: bool = False
         # Clone-in-progress state. _cloning_repo_index points into github_repos.
         self._cloning_repo_index: int | None = None
+        self._creating_name: str | None = None
+        self._creating_was_private: bool = True
         self._spinner_frame: int = 0
         self._spinner_timer = None  # set_interval handle
 
@@ -907,14 +1047,38 @@ class ProjectsApp(App):
     def _post_clone_local_loaded(
         self, local_projects: list[dict], target: str
     ) -> None:
-        self.local_projects = local_projects
         target_path = Path(target)
+        new_project = next(
+            (p for p in local_projects if p["path"] == target_path), None
+        )
+
+        # If this scan was triggered by a CREATE (not a clone), our
+        # github_repos cache is stale — the new repo on github.com isn't in
+        # it. Synthesize an entry now so the sync glyph reflects reality;
+        # background github refetch (below) replaces it with real metadata.
+        was_creating = self._creating_name is not None
+        if was_creating and new_project is not None:
+            self._synthesize_github_entry(new_project)
+
+        # Clear creation state. Spinner stops if no clone is also running.
+        self._creating_name = None
+        self._stop_spinner()
+
+        self.local_projects = local_projects
+
+        # Setting view to "local" triggers watch_view → _populate_list, but
+        # reactive watchers don't fire on no-op assignments. If we're already
+        # in local view (common for the new-project path), we have to populate
+        # explicitly.
+        if self.view != "local":
+            self.view = "local"
+        else:
+            self._populate_list()
+
         new_idx = next(
             (i for i, p in enumerate(local_projects) if p["path"] == target_path),
             None,
         )
-        # Switching the view triggers watch_view → _populate_list (sets cursor to 0).
-        self.view = "local"
         if new_idx is not None and new_idx > 0:
             def _select_new() -> None:
                 try:
@@ -924,6 +1088,34 @@ class ProjectsApp(App):
                 except Exception:
                     pass
             self.call_after_refresh(_select_new)
+
+        # Background-refetch github after create so metadata catches up to
+        # the synthesized entry. Skipped for clone — github state didn't
+        # change.
+        if was_creating:
+            self._refetch_github()
+
+    def _synthesize_github_entry(self, local_project: dict) -> None:
+        """Append a placeholder github_repos entry for a freshly-created repo."""
+        owner_name = local_project.get("github")
+        if not owner_name:
+            return
+        if any(r["nameWithOwner"] == owner_name for r in self.github_repos):
+            return
+        self.github_repos.append({
+            "name": local_project["name"],
+            "nameWithOwner": owner_name,
+            "primaryLanguage": None,
+            "visibility": "private" if self._creating_was_private else "public",
+        })
+
+    @work(thread=True, exclusive=True, group="github_refetch")
+    def _refetch_github(self) -> None:
+        github_repos = fetch_github_repos()
+        # Reuse _on_github_loaded — it already does the right in-place
+        # refresh in local view (preserves cursor) and full repopulate in
+        # github view.
+        self.call_from_thread(self._on_github_loaded, github_repos)
 
     def _jump_to_local_for_remote(self, owner_name: str) -> None:
         new_idx = next(
@@ -948,14 +1140,143 @@ class ProjectsApp(App):
                     pass
             self.call_after_refresh(_select)
 
+    # ── new project ────────────────────────────────────────────────────────
+
+    def action_new_project(self) -> None:
+        if self._cloning_repo_index is not None:
+            self.notify(
+                "Wait for the current clone to finish first",
+                severity="warning",
+            )
+            return
+
+        def handle_result(result: dict | None) -> None:
+            if result is None:
+                return
+            self._creating_name = result["name"]
+            self._creating_was_private = result["private"]
+            self._start_spinner()
+            self._update_banner_stats()  # immediate first paint of "creating …"
+            self._create_project(
+                result["name"], result["private"], result["description"]
+            )
+
+        self.push_screen(NewProjectModal(), handle_result)
+
+    @work(thread=True)
+    def _create_project(
+        self, name: str, is_private: bool, description: str
+    ) -> None:
+        target = PROJECTS_DIR / name
+        logger.info(
+            "create_project start: name=%s private=%s target=%s",
+            name, is_private, target,
+        )
+
+        # mkdir
+        try:
+            target.mkdir(parents=True)
+        except OSError as e:
+            logger.error("mkdir failed: %s", e)
+            self.call_from_thread(
+                self.notify,
+                f"Couldn't create {target}: {e}",
+                severity="error",
+                timeout=6,
+            )
+            return
+
+        def fail(msg: str) -> None:
+            logger.error("create_project fail: %s", msg)
+            self.call_from_thread(
+                self.notify, msg, severity="error", timeout=6
+            )
+
+        # git init
+        cmd = ["git", "-C", str(target), "init", "-b", "main"]
+        logger.debug("$ %s", " ".join(cmd))
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        logger.debug(
+            "git init: rc=%d stdout=%r stderr=%r",
+            r.returncode, r.stdout.strip()[:200], r.stderr.strip()[:200],
+        )
+        if r.returncode != 0:
+            fail(f"git init failed: {r.stderr.strip()[:120]}")
+            return
+
+        # README + initial commit so we have something to push
+        readme = target / "README.md"
+        readme.write_text(
+            f"# {name}\n\n{description}\n" if description else f"# {name}\n"
+        )
+
+        cmd = ["git", "-C", str(target), "add", "."]
+        logger.debug("$ %s", " ".join(cmd))
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        logger.debug(
+            "git add: rc=%d stderr=%r",
+            r.returncode, r.stderr.strip()[:200],
+        )
+        if r.returncode != 0:
+            fail(f"git add failed: {r.stderr.strip()[:120]}")
+            return
+
+        cmd = ["git", "-C", str(target), "commit", "-m", "initial commit"]
+        logger.debug("$ %s", " ".join(cmd))
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        logger.debug(
+            "git commit: rc=%d stdout=%r stderr=%r",
+            r.returncode, r.stdout.strip()[:200], r.stderr.strip()[:200],
+        )
+        if r.returncode != 0:
+            fail(f"git commit failed: {r.stderr.strip()[:120]}")
+            return
+
+        # gh repo create + push
+        gh_args = [
+            "gh", "repo", "create", name,
+            "--source", str(target),
+            "--push",
+            "--private" if is_private else "--public",
+        ]
+        if description:
+            gh_args.extend(["--description", description])
+        logger.debug("$ %s", " ".join(gh_args))
+        r = subprocess.run(gh_args, capture_output=True, text=True)
+        logger.info(
+            "gh repo create: rc=%d stdout=%r stderr=%r",
+            r.returncode, r.stdout.strip()[:300], r.stderr.strip()[:300],
+        )
+        if r.returncode != 0:
+            self.call_from_thread(
+                self.notify,
+                f"GitHub create failed (local repo intact): "
+                f"{r.stderr.strip()[:120]}",
+                severity="warning",
+                timeout=8,
+            )
+        else:
+            self.call_from_thread(
+                self.notify,
+                f"Created {name}",
+                severity="information",
+                timeout=3,
+            )
+
+        # Either way, refresh local list and jump to the new project.
+        self.call_from_thread(self._refresh_after_clone, str(target))
+
     # ── clone spinner ──────────────────────────────────────────────────────
 
     def _start_spinner(self) -> None:
-        self._spinner_frame = 0
         if self._spinner_timer is None:
+            self._spinner_frame = 0
             self._spinner_timer = self.set_interval(0.08, self._tick_spinner)
 
     def _stop_spinner(self) -> None:
+        """Stop only when no animated state is active (clone OR create)."""
+        if self._cloning_repo_index is not None or self._creating_name is not None:
+            return
         if self._spinner_timer is not None:
             self._spinner_timer.stop()
             self._spinner_timer = None
@@ -963,22 +1284,23 @@ class ProjectsApp(App):
 
     def _tick_spinner(self) -> None:
         self._spinner_frame = (self._spinner_frame + 1) % len(SPINNER_FRAMES)
+        # Cloning row + detail
         idx = self._cloning_repo_index
-        if idx is None or self.view != "github":
-            return
-        # Update the cloning row's prompt
-        try:
-            plist = self.query_one(OptionList)
-            if 0 <= idx < len(self.github_repos):
-                focused = idx == self._last_highlighted
-                plist.replace_option_prompt_at_index(
-                    idx, self._cloning_row(self.github_repos[idx], focused)
-                )
-        except Exception:
-            pass
-        # If the user is looking at the cloning project, update the detail too
-        if self._last_highlighted == idx and 0 <= idx < len(self.github_repos):
-            self._show_github_detail(self.github_repos[idx])
+        if idx is not None and self.view == "github":
+            try:
+                plist = self.query_one(OptionList)
+                if 0 <= idx < len(self.github_repos):
+                    focused = idx == self._last_highlighted
+                    plist.replace_option_prompt_at_index(
+                        idx, self._cloning_row(self.github_repos[idx], focused)
+                    )
+            except Exception:
+                pass
+            if self._last_highlighted == idx and 0 <= idx < len(self.github_repos):
+                self._show_github_detail(self.github_repos[idx])
+        # Banner stats during a create
+        if self._creating_name is not None:
+            self._update_banner_stats()
 
     def on_resize(self) -> None:
         """Re-render right-padded list rows when the layout reflows."""
