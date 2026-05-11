@@ -353,11 +353,13 @@ class NewProjectModal(ModalScreen[dict | None]):
             self.notify("Name is required", severity="warning")
             self.query_one("#name-input", Input).focus()
             return
-        if "/" in name or " " in name:
-            self.notify(
-                "Name can't contain slashes or spaces", severity="warning"
-            )
+        if "/" in name:
+            self.notify("Name can't contain slashes", severity="warning")
             return
+        # Convert internal whitespace to dashes (matches github.com's
+        # new-repo input behavior — type "my new project", get "my-new-project").
+        # Runs of whitespace collapse to a single dash.
+        name = "-".join(name.split())
         target = PROJECTS_DIR / name
         if target.exists():
             self.notify(
