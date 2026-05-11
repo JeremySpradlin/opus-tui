@@ -22,9 +22,19 @@ A "local project" is defined as a direct subdirectory of `~/Projects/` that cont
 
 ## Architecture
 
-Two files, deliberately. The split is by *concern*, not size — `theme.py` is the only thing that talks to Omarchy.
+Five files, split by concern (data / UI / orchestration / theming / entry):
 
-### `main.py` — `ProjectsApp` (Textual `App`)
+```
+main.py     entry point: setup_logging + main()
+app.py      ProjectsApp orchestrator (the Textual App subclass)
+widgets.py  Banner, DetailPanel, modals, pure render helpers, UI constants
+git_ops.py  pure data layer (gh + git + ~/Projects scan)
+theme.py    Omarchy palette → Textual theme + AppColors dataclass
+```
+
+Dependency direction: `main.py` → `app.py` → (`widgets.py` + `git_ops.py` + `theme.py`). `widgets.py` and `git_ops.py` know nothing about each other or about `app.py`. Render helpers in `widgets.py` are free functions taking `(item, colors, …)` parameters — they don't reach into `ProjectsApp` state. The single exception is the `Banner` class, which is a Textual widget and stores `_colors` so `on_resize` can re-render without an external push; its `apply_theme(colors)` and `show_stats(view, …, colors, …)` methods accept fresh data.
+
+### `app.py` — `ProjectsApp` (Textual `App`)
 
 Layout: `Banner` (ASCII title + stats row + heavy `Rule`) over a `Horizontal` containing an `OptionList` (project list) and a `DetailPanel` (focused-item details), with a `Footer` for the keybinding hints.
 
@@ -44,7 +54,7 @@ Threaded work uses `@work(thread=True)` with `call_from_thread` to bounce result
 Reads `~/.config/omarchy/current/theme.name` and `~/.config/omarchy/current/theme/colors.toml`, maps the 16-color palette onto two consumers:
 
 1. `palette_to_textual_theme()` → `textual.theme.Theme` for Textual's CSS variables (`$primary`, `$background`, etc.).
-2. `palette_to_app_colors()` → `AppColors` dataclass with semantic names (`glyph_synced`, `view_local`, `banner_gradient`, …) used by row/detail/banner renderers. **All ad-hoc color choices in `main.py` should pull from `AppColors`** — don't hardcode hex.
+2. `palette_to_app_colors()` → `AppColors` dataclass with semantic names (`glyph_synced`, `view_local`, `banner_gradient`, …) used by row/detail/banner renderers. **All ad-hoc color choices in `app.py` and `widgets.py` should pull from `AppColors`** — don't hardcode hex.
 
 `FALLBACK_PALETTE` is Catppuccin Mocha with one deliberate deviation: `accent` is mauve (not Catppuccin's official peach) to preserve the banner's identity when Omarchy isn't installed.
 
@@ -52,7 +62,7 @@ Reads `~/.config/omarchy/current/theme.name` and `~/.config/omarchy/current/them
 
 ### Intentionally not themed
 
-`LANGUAGE_COLORS` (the dict at the top of `main.py`) uses GitHub linguist colors verbatim — Python yellow, Rust orange, etc. — because they're semantic and globally recognized. There's a comment explaining this; don't "fix" it by routing through `AppColors`.
+`LANGUAGE_COLORS` (the dict near the top of `widgets.py`) uses GitHub linguist colors verbatim — Python yellow, Rust orange, etc. — because they're semantic and globally recognized. There's a comment explaining this; don't "fix" it by routing through `AppColors`.
 
 ## Keybindings
 
