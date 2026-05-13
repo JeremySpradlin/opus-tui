@@ -17,7 +17,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.reactive import reactive
-from textual.widgets import Footer, OptionList
+from textual.widgets import Footer, Input, OptionList
 
 from git_ops import (
     PROJECTS_DIR,
@@ -85,6 +85,16 @@ class ProjectsApp(App):
         background: $surface;
         color: $foreground;
     }
+    #search {
+        height: 1;
+        background: $surface;
+        color: $foreground;
+        border: none;
+        padding: 0 2;
+    }
+    #search.hidden {
+        display: none;
+    }
     """
 
     BINDINGS = [
@@ -95,6 +105,8 @@ class ProjectsApp(App):
         Binding("d", "delete_project", "Delete"),
         Binding("o", "open_project", "Open"),
         Binding("r", "refresh", "Refresh"),
+        Binding("slash", "open_search", "Search", key_display="/"),
+        Binding("escape", "close_search", show=False),
     ]
 
     view: reactive[str] = reactive("local", init=False)
@@ -115,12 +127,21 @@ class ProjectsApp(App):
         self._creating_was_private: bool = True
         self._spinner_frame: int = 0
         self._spinner_timer = None  # set_interval handle
+        # Search/filter state. `_visible_indices` maps OptionList row index →
+        # index into the current view's data list (local_projects or
+        # github_repos). When no filter is active it's `range(len(items))`.
+        # All actions that read self._last_highlighted as a data index MUST
+        # route through _data_idx() first.
+        self._search_query: str = ""
+        self._visible_indices: list[int] = []
+        self._search_active: bool = False
 
     def compose(self) -> ComposeResult:
         yield Banner(self._app_colors)
         with Horizontal(id="main"):
             yield OptionList(id="projects")
             yield DetailPanel(id="detail")
+        yield Input(id="search", placeholder="filter by name…", classes="hidden")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -180,17 +201,45 @@ class ProjectsApp(App):
         except Exception:
             return 40
 
-    def _row_for_index(self, idx: int, focused: bool) -> Text:
-        """Render any list row, special-casing the cloning one if applicable."""
-        items = self.local_projects if self.view == "local" else self.github_repos
-        if not (0 <= idx < len(items)):
+    def _current_items(self) -> list[dict]:
+        return self.local_projects if self.view == "local" else self.github_repos
+
+    def _compute_visible(self) -> None:
+        """Rebuild _visible_indices from current view + search query."""
+        items = self._current_items()
+        if self._search_query:
+            q = self._search_query.lower()
+            self._visible_indices = [
+                i for i, item in enumerate(items) if q in item["name"].lower()
+            ]
+        else:
+            self._visible_indices = list(range(len(items)))
+
+    def _data_idx(self, row_idx: int | None) -> int | None:
+        """Map an OptionList row index → index into the data list."""
+        if row_idx is None or not (0 <= row_idx < len(self._visible_indices)):
+            return None
+        return self._visible_indices[row_idx]
+
+    def _row_idx_for_data(self, data_idx: int) -> int | None:
+        """Reverse map: data index → OptionList row index (None if filtered out)."""
+        try:
+            return self._visible_indices.index(data_idx)
+        except ValueError:
+            return None
+
+    def _row_for_index(self, row_idx: int, focused: bool) -> Text:
+        """Render the OptionList row at the given visible row index."""
+        data_idx = self._data_idx(row_idx)
+        if data_idx is None:
             return Text()
+        items = self._current_items()
         width = self._list_content_width()
-        if self.view == "github" and idx == self._cloning_repo_index:
+        if self.view == "github" and data_idx == self._cloning_repo_index:
             return cloning_row(
-                items[idx], focused, self._spinner_frame, self._app_colors, width,
+                items[data_idx], focused, self._spinner_frame, self._app_colors, width,
             )
-        item = items[idx]
+        item = items[data_idx]
         if self.view == "local":
             synced = item.get("github") in self._github_set
         else:
@@ -216,6 +265,7 @@ class ProjectsApp(App):
 
     def _populate_list(self) -> None:
         self._update_banner_stats()
+        self._compute_visible()
 
         plist = self.query_one(OptionList)
 
@@ -231,13 +281,15 @@ class ProjectsApp(App):
         plist.clear_options()
         self._last_highlighted = None
 
-        items = self.local_projects if self.view == "local" else self.github_repos
-        if not items:
-            self._show_empty_detail()
+        if not self._visible_indices:
+            if self._search_query:
+                self._show_no_matches_detail()
+            else:
+                self._show_empty_detail()
             return
 
-        for i in range(len(items)):
-            plist.add_option(self._row_for_index(i, focused=False))
+        for row_idx in range(len(self._visible_indices)):
+            plist.add_option(self._row_for_index(row_idx, focused=False))
 
         # Explicit first-row selection. OptionList auto-highlights index 0 on
         # first add and fires OptionHighlighted, but timing is racy with the
@@ -246,24 +298,25 @@ class ProjectsApp(App):
         # now-known content width.
         self._last_highlighted = 0
         plist.highlighted = 0  # Textual's selection state (Enter will trigger OptionSelected)
-        plist.focus()          # loading-state transition can drop focus; re-assert
+        # Don't steal focus from the search input while the user is typing.
+        if not self._search_active:
+            plist.focus()
         self._update_detail_for_index(0)
         self.call_after_refresh(self._refresh_list_rows)
 
     def _refresh_list_rows(self) -> None:
-        """Re-render every list row at current OptionList width."""
-        items = self.local_projects if self.view == "local" else self.github_repos
-        if not items:
+        """Re-render every visible list row at current OptionList width."""
+        if not self._visible_indices:
             return
         try:
             plist = self.query_one(OptionList)
         except Exception:
             return
-        for idx in range(len(items)):
-            focused = idx == self._last_highlighted
+        for row_idx in range(len(self._visible_indices)):
+            focused = row_idx == self._last_highlighted
             try:
                 plist.replace_option_prompt_at_index(
-                    idx, self._row_for_index(idx, focused)
+                    row_idx, self._row_for_index(row_idx, focused)
                 )
             except Exception:
                 pass
@@ -294,15 +347,16 @@ class ProjectsApp(App):
 
     # ── detail panel ───────────────────────────────────────────────────────
 
-    def _update_detail_for_index(self, idx: int) -> None:
-        items = self.local_projects if self.view == "local" else self.github_repos
-        if not (0 <= idx < len(items)):
+    def _update_detail_for_index(self, row_idx: int) -> None:
+        data_idx = self._data_idx(row_idx)
+        if data_idx is None:
             self._show_empty_detail()
             return
+        items = self._current_items()
         if self.view == "local":
-            self._show_local_detail(items[idx])
+            self._show_local_detail(items[data_idx])
         else:
-            self._show_github_detail(items[idx])
+            self._show_github_detail(items[data_idx])
 
     def _show_empty_detail(self) -> None:
         c = self._app_colors
@@ -314,6 +368,12 @@ class ProjectsApp(App):
         c = self._app_colors
         self.query_one(DetailPanel).update(
             Text("loading github repos…", style=f"italic {c.subtle}")
+        )
+
+    def _show_no_matches_detail(self) -> None:
+        c = self._app_colors
+        self.query_one(DetailPanel).update(
+            Text(f"(no matches for '{self._search_query}')", style=f"dim {c.dim}")
         )
 
     def _ensure_git_status(self, project: dict) -> None:
@@ -455,6 +515,11 @@ class ProjectsApp(App):
     # ── reactive watchers + actions ────────────────────────────────────────
 
     def watch_view(self, _old: str, _new: str) -> None:
+        # Filter is per-view: clear it on toggle so the new view shows everything.
+        # The Input widget's value is reset by action_open_search next time the
+        # user opens search, so no need to touch it here.
+        if self._search_query:
+            self._search_query = ""
         if self.local_projects or self.github_repos:
             self._populate_list()
 
@@ -480,12 +545,11 @@ class ProjectsApp(App):
         if self._cloning_repo_index is not None:
             self.notify("A clone is already in progress", severity="warning")
             return
-        if self._last_highlighted is None or not self.github_repos:
+        row_idx = self._last_highlighted
+        data_idx = self._data_idx(row_idx)
+        if data_idx is None or not self.github_repos:
             return
-        idx = self._last_highlighted
-        if not (0 <= idx < len(self.github_repos)):
-            return
-        repo = self.github_repos[idx]
+        repo = self.github_repos[data_idx]
         owner_name = repo["nameWithOwner"]
 
         # Already cloned: smart-jump to the local project instead.
@@ -502,24 +566,24 @@ class ProjectsApp(App):
             )
             return
 
-        self._cloning_repo_index = idx
+        self._cloning_repo_index = data_idx
         self._start_spinner()
         # Initial render of the cloning state for both row and detail.
         try:
             plist = self.query_one(OptionList)
             plist.replace_option_prompt_at_index(
-                idx,
+                row_idx,
                 cloning_row(
-                    repo, idx == self._last_highlighted,
+                    repo, row_idx == self._last_highlighted,
                     self._spinner_frame, self._app_colors,
                     self._list_content_width(),
                 ),
             )
         except Exception:
             pass
-        if self._last_highlighted == idx:
+        if self._last_highlighted == row_idx:
             self._show_github_detail(repo)
-        self.clone_repo(owner_name, str(target), idx)
+        self.clone_repo(owner_name, str(target), data_idx)
 
     @work(thread=True)
     def clone_repo(self, owner_name: str, target: str, idx: int) -> None:
@@ -545,7 +609,7 @@ class ProjectsApp(App):
         )
 
     def _on_clone_done(
-        self, owner_name: str, target: str, idx: int, success: bool, err: str
+        self, owner_name: str, target: str, data_idx: int, success: bool, err: str
     ) -> None:
         self._stop_spinner()
         self._cloning_repo_index = None
@@ -555,16 +619,18 @@ class ProjectsApp(App):
             self._refresh_after_clone(target)
             return
 
-        # Failure: restore the row + detail to their pre-clone state.
-        try:
-            plist = self.query_one(OptionList)
-            if 0 <= idx < len(self.github_repos):
-                focused = idx == self._last_highlighted
+        # Failure: restore the row + detail to their pre-clone state. The row
+        # may have been filtered out while the clone was running — skip if so.
+        row_idx = self._row_idx_for_data(data_idx)
+        if row_idx is not None:
+            try:
+                plist = self.query_one(OptionList)
+                focused = row_idx == self._last_highlighted
                 plist.replace_option_prompt_at_index(
-                    idx, self._row_for_index(idx, focused),
+                    row_idx, self._row_for_index(row_idx, focused),
                 )
-        except Exception:
-            pass
+            except Exception:
+                pass
         if self._last_highlighted is not None:
             self._update_detail_for_index(self._last_highlighted)
         self.notify(f"Clone failed: {err[:120]}", severity="error", timeout=6)
@@ -595,6 +661,10 @@ class ProjectsApp(App):
         self._stop_spinner()
 
         self.local_projects = local_projects
+
+        # Clear any active search filter so the freshly-created/cloned project
+        # is visible (its name likely doesn't match the prior filter).
+        self._search_query = ""
 
         # Setting view to "local" triggers watch_view → _populate_list, but
         # reactive watchers don't fire on no-op assignments. If we're already
@@ -861,12 +931,10 @@ class ProjectsApp(App):
                 severity="warning",
             )
             return
-        if self._last_highlighted is None or not self.local_projects:
+        data_idx = self._data_idx(self._last_highlighted)
+        if data_idx is None or not self.local_projects:
             return
-        idx = self._last_highlighted
-        if not (0 <= idx < len(self.local_projects)):
-            return
-        project = self.local_projects[idx]
+        project = self.local_projects[data_idx]
         name = project["name"]
         path = project["path"]
         owner_name = project.get("github")
@@ -1013,12 +1081,10 @@ class ProjectsApp(App):
                 severity="information",
             )
             return
-        if self._last_highlighted is None or not self.local_projects:
+        data_idx = self._data_idx(self._last_highlighted)
+        if data_idx is None or not self.local_projects:
             return
-        idx = self._last_highlighted
-        if not (0 <= idx < len(self.local_projects)):
-            return
-        project = self.local_projects[idx]
+        project = self.local_projects[data_idx]
         name = project["name"]
         path = project["path"]
         if not path.is_dir():
@@ -1066,20 +1132,25 @@ class ProjectsApp(App):
 
     def _tick_spinner(self) -> None:
         self._spinner_frame = (self._spinner_frame + 1) % len(SPINNER_FRAMES)
-        # Cloning row + detail
-        idx = self._cloning_repo_index
-        if idx is not None and self.view == "github":
-            try:
-                plist = self.query_one(OptionList)
-                if 0 <= idx < len(self.github_repos):
-                    focused = idx == self._last_highlighted
+        # Cloning row + detail. _cloning_repo_index is a data index; the row
+        # may be filtered out of view, in which case we skip the row repaint.
+        data_idx = self._cloning_repo_index
+        if data_idx is not None and self.view == "github":
+            row_idx = self._row_idx_for_data(data_idx)
+            if row_idx is not None:
+                try:
+                    plist = self.query_one(OptionList)
+                    focused = row_idx == self._last_highlighted
                     plist.replace_option_prompt_at_index(
-                        idx, self._row_for_index(idx, focused),
+                        row_idx, self._row_for_index(row_idx, focused),
                     )
-            except Exception:
-                pass
-            if self._last_highlighted == idx and 0 <= idx < len(self.github_repos):
-                self._show_github_detail(self.github_repos[idx])
+                except Exception:
+                    pass
+            if (
+                self._data_idx(self._last_highlighted) == data_idx
+                and 0 <= data_idx < len(self.github_repos)
+            ):
+                self._show_github_detail(self.github_repos[data_idx])
         # Banner stats during a create
         if self._creating_name is not None:
             self._update_banner_stats()
@@ -1087,3 +1158,66 @@ class ProjectsApp(App):
     def on_resize(self) -> None:
         """Re-render right-padded list rows when the layout reflows."""
         self._refresh_list_rows()
+
+    # ── search / filter ────────────────────────────────────────────────────
+
+    def action_open_search(self) -> None:
+        """`/` — show the search input and focus it. Resets any prior query."""
+        try:
+            search = self.query_one("#search", Input)
+        except Exception:
+            return  # not on the main screen (e.g. a modal is up)
+        self._search_active = True
+        # Reset to a clean filter every time the user opens search. If the
+        # value differs from "", this fires Input.Changed → _on_search_changed
+        # which clears the filter and repopulates.
+        self._search_query = ""
+        search.value = ""
+        search.remove_class("hidden")
+        search.focus()
+
+    def action_close_search(self) -> None:
+        """Escape — clear filter and close the search input.
+
+        Also clears a *committed* filter (input hidden after Enter), so the
+        user can recover the full list with Esc whether the input is open or
+        not.
+        """
+        if not self._search_active and not self._search_query:
+            return
+        try:
+            search = self.query_one("#search", Input)
+        except Exception:
+            return
+        self._search_active = False
+        search.add_class("hidden")
+        # Two cases for clearing the query + repopulating the list:
+        #   1. Input still has text — set value = "", which fires Input.Changed;
+        #      that handler clears _search_query and repopulates.
+        #   2. Input is already empty but _search_query is non-empty (Esc after
+        #      Enter-commit with no further typing) — clear and populate here.
+        if search.value:
+            search.value = ""
+        elif self._search_query:
+            self._search_query = ""
+            self._populate_list()
+        self.query_one(OptionList).focus()
+
+    @on(Input.Changed, "#search")
+    def _on_search_changed(self, event: Input.Changed) -> None:
+        new_query = event.value.strip()
+        if new_query == self._search_query:
+            return
+        self._search_query = new_query
+        self._populate_list()
+
+    @on(Input.Submitted, "#search")
+    def _on_search_submitted(self, _event: Input.Submitted) -> None:
+        """Enter in the search input — commit filter, hide input, focus list."""
+        try:
+            search = self.query_one("#search", Input)
+        except Exception:
+            return
+        self._search_active = False
+        search.add_class("hidden")
+        self.query_one(OptionList).focus()
