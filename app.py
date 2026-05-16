@@ -1101,6 +1101,7 @@ class ProjectsApp(App):
             subprocess.Popen(
                 ["omarchy-launch-editor", str(path)],
                 start_new_session=True,
+                cwd=str(path),
             )
         except FileNotFoundError:
             logger.error("open_project: omarchy-launch-editor not on PATH")
